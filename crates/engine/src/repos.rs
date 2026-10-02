@@ -338,6 +338,49 @@ impl Repos {
         })
     }
 
+    /// Identity shared by every clone and worktree of one repository: the
+    /// normalized `origin` remote (else the first remote) as `host/owner/repo`.
+    /// A repository without a parseable remote falls back to
+    /// `local:sha256(deviceId ‖ NUL ‖ canonical common git dir)`, so its
+    /// worktrees on this device still match each other.
+    pub async fn repository_identity(&self, path: &Path) -> Result<String, EngineError> {
+        let remote = match self.git(&["remote", "get-url", "origin"], Some(path)).await {
+            Ok(url) => Some(url),
+            Err(_) => match self.git(&["remote"], Some(path)).await {
+                Ok(names) => match names.lines().next() {
+                    Some(name) => self
+                        .git(&["remote", "get-url", name.trim()], Some(path))
+                        .await
+                        .ok(),
+                    None => None,
+                },
+                Err(_) => None,
+            },
+        };
+        if let Some(remote) = remote
+            .as_deref()
+            .and_then(crate::source_control::parse_git_remote)
+        {
+            return Ok(
+                format!("{}/{}/{}", remote.host, remote.owner, remote.repository)
+                    .to_ascii_lowercase(),
+            );
+        }
+        let common_dir = self
+            .git(
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                Some(path),
+            )
+            .await?;
+        let canonical =
+            std::fs::canonicalize(&common_dir).unwrap_or_else(|_| PathBuf::from(&common_dir));
+        let mut hasher = Sha256::new();
+        hasher.update(self.inner.device_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        Ok(format!("local:{}", hex(&hasher.finalize())))
+    }
+
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {
         let branch = self.current_branch(path).await.ok();
         Ok(Repo {

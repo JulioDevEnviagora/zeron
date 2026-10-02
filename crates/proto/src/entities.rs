@@ -128,6 +128,12 @@ pub struct Space {
     /// (sha256(deviceId ‖ NUL ‖ git_dir)) — diff grouping key for root sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
+    /// Owner-stamped when git: identity shared by every clone and worktree of
+    /// one repository — the normalized origin remote (`host/owner/repo`), else
+    /// `local:` + a device-scoped hash of the common git dir. Projects with
+    /// equal ids group together in the sidebar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

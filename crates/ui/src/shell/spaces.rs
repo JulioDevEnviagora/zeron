@@ -919,6 +919,81 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn sidebar_projects_sharing_a_repository_group_only_by_project(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    // The same repository on this device and on another,
+                    // plus an unrelated local project.
+                    state.spaces = [
+                        ("remote-clone", "remote", Some("github.com/o/r"), 0),
+                        ("local-clone", "local", Some("github.com/o/r"), 1),
+                        ("other", "local", None, 2),
+                    ]
+                    .into_iter()
+                    .map(|(id, device, repository, minutes)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "deviceId": device, "path": format!("/{device}/{id}"),
+                            "name": id, "repositoryId": repository,
+                            "createdAt": Utc::now() - chrono::Duration::minutes(10 - minutes),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                    state.chats = [
+                        ("remote-new", "remote-clone", "remote"),
+                        ("other-mid", "other", "local"),
+                        ("local-old", "local-clone", "local"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, (id, space, device))| {
+                        let mut chat = pin_test_chat(id);
+                        chat.space_id = Some(space.into());
+                        chat.device_id = device.into();
+                        chat.created_at = Utc::now() - chrono::Duration::minutes(ix as i64);
+                        chat
+                    })
+                    .collect();
+                });
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["remote-new", "local-old", "other-mid"])
+                );
+                // The oldest clone names the group on every device; this
+                // device's checkout leads the project's members.
+                let state = shell.state.read(cx);
+                let local_chat = state.chats.iter().find(|c| c.id == "local-old").unwrap();
+                assert_eq!(
+                    sidebar_project_group(state, local_chat),
+                    ("repo:github.com/o/r".into(), "remote-clone".into())
+                );
+                let local_space = state.space_row("local-clone").unwrap();
+                assert_eq!(state.representative_space(local_space).id, "remote-clone");
+                let members: Vec<&str> = state
+                    .project_members(local_space)
+                    .into_iter()
+                    .map(|space| space.id.as_str())
+                    .collect();
+                assert_eq!(members, ["local-clone", "remote-clone"]);
+
+                shell.settings.sidebar_organization = SidebarOrganization::ByDevice;
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["other-mid", "local-old", "remote-new"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn sidebar_remote_pins_ignore_old_local_preferences(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let window = pin_test_shell(cx, dir.path());
@@ -2097,12 +2172,34 @@ fn promote_local_device_group<T>(
     }
 }
 
+/// Project-mode group of a chat as (key, label). Projects sharing a
+/// repository identity fold into one group named for their representative
+/// space; project-less sessions group per device and read as `~`.
+fn sidebar_project_group(state: &AppState, chat: &zeron_proto::Chat) -> (String, String) {
+    match state.space_for_chat(chat) {
+        Some(space) => (
+            zeron_proto::view::project_key(space),
+            state.representative_space(space).display_name().to_string(),
+        ),
+        None => match chat.space_id.clone() {
+            Some(space_id) => (space_id, "?".to_string()),
+            None => (format!("home:{}", chat.device_id), "~".to_string()),
+        },
+    }
+}
+
 /// Shared quiet rule for sidebar groups and palette sections.
 pub(super) fn sidebar_separator(theme: &Theme) -> gpui::Div {
     div().h(px(1.0)).bg(theme.border.opacity(0.6))
 }
 
-fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyElement) -> gpui::Div {
+/// `icon` leads the label — a project group's icon, which its rows then omit.
+fn sidebar_disclosure_header(
+    theme: &Theme,
+    icon: Option<AnyElement>,
+    label: SharedString,
+    chevron: AnyElement,
+) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -2111,6 +2208,7 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
         .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
         .px(px(Theme::SPACE_SM))
         .cursor_pointer()
+        .children(icon)
         .child(super::sidebar_faded_label(
             "sidebar-disclosure-label".into(),
             false,
@@ -4254,9 +4352,7 @@ impl Shell {
             for chat in chats {
                 let key = Some((
                     if self.settings.sidebar_organization == SidebarOrganization::ByProject {
-                        chat.space_id
-                            .clone()
-                            .unwrap_or_else(|| format!("home:{}", chat.device_id))
+                        sidebar_project_group(state, &chat).0
                     } else {
                         chat.device_id.clone()
                     },
@@ -4317,7 +4413,7 @@ impl Shell {
             .device_name(&chat.device_id)
             .unwrap_or("Unknown device")
             .to_string();
-        let mut folder = project.clone();
+        let mut folder = project;
         // Unknown device → no fragment, same as the archived list.
         if state.device_name(&chat.device_id).is_some() {
             folder = format!("{folder} @ {device}");
@@ -4335,12 +4431,7 @@ impl Shell {
             .filter(|_| self.settings.sidebar_show_pull_request);
         let group = match self.settings.sidebar_organization {
             SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
-            SidebarOrganization::ByProject => Some((
-                chat.space_id
-                    .clone()
-                    .unwrap_or_else(|| format!("home:{}", chat.device_id)),
-                project,
-            )),
+            SidebarOrganization::ByProject => Some(sidebar_project_group(state, &chat)),
             SidebarOrganization::InOneList => None,
         };
         ActiveChatRow {
@@ -4588,6 +4679,16 @@ impl Shell {
                     .as_ref()
                     .map_or_else(|| "regular".to_owned(), |(key, _)| format!("regular:{key}"))
             };
+            // A project group wears the project icon on its header instead
+            // of repeating it on every row.
+            let project_group = self.settings.sidebar_organization
+                == SidebarOrganization::ByProject
+                && group
+                    .as_ref()
+                    .is_some_and(|(key, _)| !key.starts_with("section:"));
+            let header_icon_chat = (project_group && self.settings.sidebar_show_project_icon)
+                .then(|| rows.first().map(|row| row.chat.id.clone()))
+                .flatten();
             let mut rendered_rows = Vec::with_capacity(rows.len());
             for (group_index, row) in rows.into_iter().enumerate() {
                 let ActiveChatRow {
@@ -4672,6 +4773,7 @@ impl Shell {
                     is_moving,
                     if is_moving { None } else { drag },
                     jump_label,
+                    self.settings.sidebar_show_project_icon && !project_group,
                     None,
                     theme,
                     cx,
@@ -4811,7 +4913,10 @@ impl Shell {
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion_key = motion_key.clone();
-            let header = sidebar_disclosure_header(theme, visible_label, chevron)
+            let icon = header_icon_chat.map(|chat_id| {
+                self.render_project_group_icon(&chat_id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, cx)
+            });
+            let header = sidebar_disclosure_header(theme, icon, visible_label, chevron)
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
@@ -4870,7 +4975,7 @@ impl Shell {
             format!("Pinned ({})", items.len()).into()
         };
         let chevron = self.sidebar_disclosure_chevron("pinned", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, None, label, chevron)
             .id("pinned-toggle")
             .debug_selector(|| "pinned-toggle".into())
             .on_drag_move::<SidebarSessionDrag>(cx.listener(
@@ -4950,7 +5055,7 @@ impl Shell {
             format!("Sessions ({count})").into()
         };
         let chevron = self.sidebar_disclosure_chevron("sessions", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, None, label, chevron)
             .id("sessions-toggle")
             .debug_selector(|| "sessions-toggle".into())
             .on_drag_move::<SidebarSessionDrag>(cx.listener(
@@ -5086,7 +5191,7 @@ impl Shell {
             format!("Archived ({total})").into()
         };
         let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, None, label, chevron)
             .id("archived-toggle")
             .on_click(cx.listener(move |this, _, _, cx| {
                 let was_open = this.archived_open;
@@ -5134,6 +5239,7 @@ impl Shell {
                         false,
                         None,
                         None,
+                        self.settings.sidebar_show_project_icon,
                         None,
                         theme,
                         cx,
@@ -5689,6 +5795,7 @@ impl Shell {
             git_detected,
             git_checked_at: None,
             checkout_id: None,
+            repository_id: None,
             created_at: Utc::now(),
         };
         self.state.update(cx, |s, cx| {

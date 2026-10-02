@@ -239,6 +239,61 @@ async fn repos_round_trip_add_branches_worktrees() {
 }
 
 #[tokio::test]
+async fn repository_identity_spans_worktrees_and_clones() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repos = test_repos(&temp.path().join("data"));
+    let repo = temp.path().join("repo");
+    init_repo(&repo).await;
+    let linked = temp.path().join("linked");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            linked.to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    // Remote-less: a repository's worktrees share a device-scoped identity.
+    let local = repos.repository_identity(&repo).await.expect("identity");
+    assert!(local.starts_with("local:"), "{local}");
+    assert_eq!(repos.repository_identity(&linked).await.unwrap(), local);
+    let clone = temp.path().join("clone");
+    init_repo(&clone).await;
+    assert_ne!(repos.repository_identity(&clone).await.unwrap(), local);
+
+    // A remote makes it portable: origin wins, else the first remote, and
+    // transport, case and `.git` don't matter.
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@github.com:Anara/Comet.git"],
+    )
+    .await;
+    git(
+        &clone,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/anara/comet",
+        ],
+    )
+    .await;
+    assert_eq!(
+        repos.repository_identity(&linked).await.unwrap(),
+        "github.com/anara/comet"
+    );
+    assert_eq!(
+        repos.repository_identity(&clone).await.unwrap(),
+        "github.com/anara/comet"
+    );
+}
+
+#[tokio::test]
 async fn git_history_is_topological_paged_and_carries_public_refs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("history-repo");
@@ -1328,6 +1383,7 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     };
     assert!(!space.git_detected, "plain folder must read as non-git");
     assert!(space.checkout_id.is_none());
+    assert!(space.repository_id.is_none());
 
     // `git init` later flips the stamp (watcher and/or explicit recheck).
     git(&folder, &["init", "-b", "main"]).await;
@@ -1346,6 +1402,14 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
             .expect("watch alive");
     };
     assert!(space.checkout_id.is_some(), "git space gains a checkout id");
+    assert!(
+        space
+            .repository_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:")),
+        "remote-less git space gains a local repository id: {:?}",
+        space.repository_id
+    );
     core.shutdown().await;
 }
 
