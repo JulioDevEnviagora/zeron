@@ -14,6 +14,12 @@ defaults:
 jobs:
   # Named like windows.yml's job so rust-cache restores its build.
   engine-tests:
+    name: engine-tests (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.x and 2.x, each installed the way users install it.
+        package: ['opencode-ai@1.18.33', '@opencode/cli@2.0.22']
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -21,39 +27,47 @@ jobs:
       - uses: ./.github/actions/windows-ci-setup
       - name: Build probes
         run: |
-          cargo build --release --locked -p zeron-harness --example opencode_turn_probe
+          cargo build --release --locked -p zeron-harness --example opencode_turn_probe --example opencode_models_probe
           cargo test --release --locked -p zeron-engine --test opencode_live --no-run
       - name: Re-enable Defender (real users have it on)
         run: |
           try { Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop; 'Defender real-time: on' }
           catch { Write-Warning "Could not re-enable Defender: $_" }
-      - name: Install OpenCode 2.0.20 like a user (npm global)
+      - name: Install ${{ matrix.package }} like a user (npm global)
         run: |
-          npm install -g @opencode/cli@2.0.20 2>&1 | Select-Object -Last 15
-          Get-Command opencode -All | Format-List Source, CommandType
-          Get-ChildItem (Split-Path (Get-Command opencode).Source) -Filter 'opencode*' | Format-Table Name, Length
-      - name: Version probe timings (cold, then warm)
+          npm install -g ${{ matrix.package }} 2>&1 | Select-Object -Last 5
+          Get-Command opencode -All | Format-List Source
+          opencode --version
+      - name: Free model catalog through Zeron
+        run: ./target/release/examples/opencode_models_probe.exe 2>&1 | Select-String -NotMatch 'options:'
+      - name: Real engine turns, prompt "hi", every free model
+        env:
+          RUST_BACKTRACE: '1'
+          OC_PROMPT: hi
         run: |
-          foreach ($i in 1..3) {
-            $t = Measure-Command { $out = & opencode --version 2>&1 }
-            "run $i : $([int]$t.TotalMilliseconds) ms -> $out"
+          $models = @(
+            @{ id = 'opencode/big-pickle' },
+            @{ id = 'opencode/nemotron-3.5-lightning-free' },
+            @{ id = 'opencode/mimo-v2.6-flash-free' },
+            @{ id = 'opencode/muse-spark-1.3-contributor-free'; reasoning = 'low' },
+            @{ id = 'opencode/space-bunny-free'; reasoning = 'low' },
+            @{ id = 'opencode/fledge-alpha-free'; reasoning = 'low' }
+          )
+          $results = @()
+          foreach ($m in $models) {
+            $env:OC_MODEL = $m.id
+            $env:OC_REASONING = $m.reasoning
+            "::group::$($m.id) reasoning=$($m.reasoning)"
+            $out = cargo test --release --locked -p zeron-engine --test opencode_live -- --ignored --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $out | Select-String -Pattern '^(TURN|  text|  ERROR|EV )'
+            "::endgroup::"
+            $results += [pscustomobject]@{ Model = $m.id; Reasoning = $m.reasoning; Passed = ($code -eq 0) }
           }
-      - name: Harness turn probe (PATH resolution)
-        continue-on-error: true
-        timeout-minutes: 10
-        env:
-          RUST_BACKTRACE: '1'
-        run: |
-          ./target/release/examples/opencode_turn_probe.exe '' opencode/big-pickle 'Reply with exactly: PONG'
-      - name: Engine turns with MCP injection
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          RUST_BACKTRACE: '1'
-        run: cargo test --release --locked -p zeron-engine --test opencode_live -- --ignored --nocapture
+          $results | Format-Table -AutoSize | Out-String -Width 200
+          if ($results | Where-Object { -not $_.Passed }) { exit 1 }
       - name: OpenCode logs
-        if: always()
+        if: failure()
         run: |
-          foreach ($dir in @("$env:USERPROFILE\.local\share\opencode\log", "$env:LOCALAPPDATA\opencode", "$env:APPDATA\opencode")) {
-            if (Test-Path $dir) { "== $dir"; Get-ChildItem $dir -Recurse -File | Select-Object -Last 5 | ForEach-Object { "-- $($_.FullName)"; Get-Content $_.FullName -Tail 80 } }
-          }
+          $dir = "$env:USERPROFILE\.local\share\opencode\log"
+          if (Test-Path $dir) { Get-ChildItem $dir -File | Sort-Object LastWriteTime | Select-Object -Last 2 | ForEach-Object { "-- $($_.FullName)"; Get-Content $_.FullName -Tail 120 } }

@@ -3,6 +3,7 @@
 //! OC_MODEL picks `provider/model` (default opencode/big-pickle); OC_MCP is
 //! the MCP server command (default: this test binary, which exits at once).
 //! OC_REASONING (e.g. low) sets the reasoning level the composer would send.
+//! OC_PROMPT replaces the PONG prompt; then any reply text passes.
 //!
 //!     cargo test -p zeron-engine --test opencode_live -- --ignored --nocapture
 use std::{sync::Arc, time::Duration};
@@ -38,6 +39,7 @@ async fn real_opencode_answers_two_turns() {
     let reasoning = std::env::var("OC_REASONING")
         .ok()
         .map(|level| serde_json::from_value(serde_json::json!(level)).expect("reasoning level"));
+    let custom_prompt = std::env::var("OC_PROMPT").ok();
     let model = std::env::var("OC_MODEL").unwrap_or_else(|_| "opencode/big-pickle".into());
     let mcp_command = std::env::var("OC_MCP").unwrap_or_else(|_| {
         std::env::current_exe()
@@ -60,7 +62,9 @@ async fn real_opencode_answers_two_turns() {
                             args: vec!["mcp".into()],
                             env: Default::default(),
                         }),
-                        prompt: "Reply with exactly: PONG".into(),
+                        prompt: custom_prompt
+                            .clone()
+                            .unwrap_or_else(|| "Reply with exactly: PONG".into()),
                         harness: Some(HarnessId::Opencode),
                         model: Some(model.clone()),
                         reasoning,
@@ -110,7 +114,11 @@ async fn real_opencode_answers_two_turns() {
                     }
                 }
                 eprintln!("  text {text:?}");
-                if timed_out || !text.contains("PONG") {
+                let answered = match custom_prompt {
+                    Some(_) => !text.trim().is_empty(),
+                    None => text.contains("PONG"),
+                };
+                if timed_out || !answered {
                     failures.push(turn);
                 }
                 break;
@@ -123,5 +131,5 @@ async fn real_opencode_answers_two_turns() {
         eprintln!("EV {event:?}");
     }
     core.shutdown().await;
-    assert!(failures.is_empty(), "turns without PONG: {failures:?}");
+    assert!(failures.is_empty(), "turns without a reply: {failures:?}");
 }
