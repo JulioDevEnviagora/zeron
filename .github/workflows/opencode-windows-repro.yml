@@ -43,7 +43,8 @@ jobs:
         timeout-minutes: 10
         env:
           RUST_BACKTRACE: '1'
-        run: ./target/release/examples/opencode_turn_probe.exe '' opencode/big-pickle 'Reply with exactly: PONG'
+        run: |
+          ./target/release/examples/opencode_turn_probe.exe '' opencode/big-pickle 'Reply with exactly: PONG'
       - name: Engine turns with MCP injection
         continue-on-error: true
         timeout-minutes: 15
