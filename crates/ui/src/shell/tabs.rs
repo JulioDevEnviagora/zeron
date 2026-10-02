@@ -310,14 +310,21 @@ impl Shell {
                         .and_then(|id| state.space_row(id))
                         .map(|s| s.display_name().to_string())
                         .unwrap_or_else(|| "~".to_string());
-                    let device = state
-                        .device_name(&chat.device_id)
-                        .unwrap_or("Unknown device");
+                    // A Cloud chat runs on its own machine, not on a device
+                    // worth naming: just the project.
+                    let target = if zeron_proto::is_cloud_device(&chat.device_id, "") {
+                        folder
+                    } else {
+                        let device = state
+                            .device_name(&chat.device_id)
+                            .unwrap_or("Unknown device");
+                        format!("{folder} @ {device}")
+                    };
                     (
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )),
-                        Some(SharedString::from(format!("{folder} @ {device}"))),
+                        Some(SharedString::from(target)),
                         chat.config.as_ref().map(|c| c.harness),
                         false,
                     )

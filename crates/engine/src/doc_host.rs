@@ -234,6 +234,9 @@ struct DocHostInner {
     /// doc-host reference each other through Arcs, so a retired runtime's
     /// graph only drops once this back-edge is severed.
     sessions: Mutex<Option<SessionsEngine>>,
+    /// Command execution held (a Cloud session machine preparing its
+    /// checkout): drains return early; `release_execution` re-drains.
+    execution_held: AtomicBool,
     workspace: OnceLock<WorkspaceHost>,
     /// Worktree materialization for Run commands (see `set_repos`).
     repos: OnceLock<crate::repos::Repos>,
@@ -409,9 +412,7 @@ impl ChatConnectionSnapshot {
             sync_requested,
             stats: client.as_ref().map(|client| client.stats()),
             delivery_live: sync_started
-                && client
-                    .as_ref()
-                    .is_some_and(|client| client.delivery_live()),
+                && client.as_ref().is_some_and(|client| client.delivery_live()),
         }
     }
 
@@ -895,6 +896,7 @@ impl DocHost {
                 store,
                 config,
                 sessions: Mutex::new(None),
+                execution_held: AtomicBool::new(false),
                 workspace: OnceLock::new(),
                 repos: OnceLock::new(),
                 project_action_runtime: OnceLock::new(),
@@ -967,6 +969,33 @@ impl DocHost {
     /// `shutdown_workers` — callers treat both as "executor unavailable".
     fn sessions(&self) -> Option<SessionsEngine> {
         lock(&self.inner.sessions).clone()
+    }
+
+    fn execution_held(&self) -> bool {
+        self.inner.execution_held.load(Ordering::Acquire)
+    }
+
+    /// Hold command execution: queued commands stay pending (their nudges and
+    /// rows are kept) until [`release_execution`](Self::release_execution).
+    /// A Cloud session machine holds while it clones its project, so the
+    /// first send can't run before its working tree exists.
+    pub fn hold_execution(&self) {
+        self.inner.execution_held.store(true, Ordering::Release);
+    }
+
+    /// End a hold and drain everything that queued meanwhile.
+    pub fn release_execution(&self) {
+        if !self.inner.execution_held.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        for handle in handles {
+            let host = self.clone();
+            self.spawn_worker(async move {
+                host.drain_commands(&handle).await;
+                host.drain_queue(&handle).await;
+            });
+        }
     }
 
     /// Wire the sessions engine (engine assembly; see `SessionsEngine::set_doc_host`).
@@ -3960,6 +3989,9 @@ impl DocHost {
     ///
     /// One at a time by design: each send changes the status this reads.
     pub async fn drain_queue(&self, handle: &Arc<ChatDocHandle>) {
+        if self.execution_held() {
+            return; // release_execution re-drains
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
@@ -4846,6 +4878,11 @@ impl DocHost {
     }
 
     async fn drain_command_kind(&self, handle: &Arc<ChatDocHandle>, controls_only: bool) {
+        // A held executor still serves controls (interrupt, answers): only
+        // new work waits for the release.
+        if self.execution_held() && !controls_only {
+            return; // release_execution re-drains
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
         };
@@ -5679,6 +5716,7 @@ impl DocHost {
             attachments: Vec::new(),
             resume: None,
             worktree: None,
+            env: Default::default(),
         })
     }
 
