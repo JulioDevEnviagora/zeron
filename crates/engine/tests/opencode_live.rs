@@ -2,6 +2,7 @@
 //! OPENCODE_EXECUTABLE), with the Zeron MCP injection every app run gets.
 //! OC_MODEL picks `provider/model` (default opencode/big-pickle); OC_MCP is
 //! the MCP server command (default: this test binary, which exits at once).
+//! OC_REASONING (e.g. low) sets the reasoning level the composer would send.
 //!
 //!     cargo test -p zeron-engine --test opencode_live -- --ignored --nocapture
 use std::{sync::Arc, time::Duration};
@@ -34,6 +35,9 @@ async fn real_opencode_answers_two_turns() {
     core.workspace
         .create_chat(CHAT, Some("p"), None, None, None)
         .unwrap();
+    let reasoning = std::env::var("OC_REASONING")
+        .ok()
+        .map(|level| serde_json::from_value(serde_json::json!(level)).expect("reasoning level"));
     let model = std::env::var("OC_MODEL").unwrap_or_else(|_| "opencode/big-pickle".into());
     let mcp_command = std::env::var("OC_MCP").unwrap_or_else(|_| {
         std::env::current_exe()
@@ -59,7 +63,7 @@ async fn real_opencode_answers_two_turns() {
                         prompt: "Reply with exactly: PONG".into(),
                         harness: Some(HarnessId::Opencode),
                         model: Some(model.clone()),
-                        reasoning: None,
+                        reasoning,
                         model_options: Default::default(),
                         cwd: cwd.clone(),
                         sandbox: SandboxLevel::WorkspaceWrite,
