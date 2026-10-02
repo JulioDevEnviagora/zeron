@@ -1,0 +1,58 @@
+name: OpenCode Windows repro
+
+on:
+  push:
+    branches: [opencode-windows-repro]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # Named like windows.yml's job so rust-cache restores its build.
+  engine-tests:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/windows-ci-setup
+      - name: Build probes
+        run: |
+          cargo build --release --locked -p zeron-harness --example opencode_turn_probe
+          cargo test --release --locked -p zeron-engine --test opencode_live --no-run
+      - name: Re-enable Defender (real users have it on)
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop; 'Defender real-time: on' }
+          catch { Write-Warning "Could not re-enable Defender: $_" }
+      - name: Install OpenCode 2.0.20 like a user (npm global)
+        run: |
+          npm install -g @opencode/cli@2.0.20 2>&1 | Select-Object -Last 15
+          Get-Command opencode -All | Format-List Source, CommandType
+          Get-ChildItem (Split-Path (Get-Command opencode).Source) -Filter 'opencode*' | Format-Table Name, Length
+      - name: Version probe timings (cold, then warm)
+        run: |
+          foreach ($i in 1..3) {
+            $t = Measure-Command { $out = & opencode --version 2>&1 }
+            "run $i : $([int]$t.TotalMilliseconds) ms -> $out"
+          }
+      - name: Harness turn probe (PATH resolution)
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          RUST_BACKTRACE: '1'
+        run: ./target/release/examples/opencode_turn_probe.exe '' opencode/big-pickle 'Reply with exactly: PONG'
+      - name: Engine turns with MCP injection
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          RUST_BACKTRACE: '1'
+        run: cargo test --release --locked -p zeron-engine --test opencode_live -- --ignored --nocapture
+      - name: OpenCode logs
+        if: always()
+        run: |
+          foreach ($dir in @("$env:USERPROFILE\.local\share\opencode\log", "$env:LOCALAPPDATA\opencode", "$env:APPDATA\opencode")) {
+            if (Test-Path $dir) { "== $dir"; Get-ChildItem $dir -Recurse -File | Select-Object -Last 5 | ForEach-Object { "-- $($_.FullName)"; Get-Content $_.FullName -Tail 80 } }
+          }

@@ -1,6 +1,6 @@
 //! Live probe: one full turn through the native driver against a chosen
 //! opencode binary — prints the event stream and exits 0 only on a
-//! Completed turn with text. Arg 1 = executable (default: PATH resolution),
+//! Completed turn with text. Arg 1 = executable (empty or absent: PATH resolution),
 //! arg 2 = model (`provider/model`), arg 3 = prompt.
 //! Optional env: OPENCODE_PROBE_WORKSPACE uses an existing configured directory,
 //! OPENCODE_PROBE_AGENT selects an agent, OPENCODE_PROBE_INTERRUPT_MS cancels
@@ -17,7 +17,7 @@ use zeron_proto::{AgentEvent, RunRequest, SandboxLevel};
 
 #[tokio::main]
 async fn main() {
-    let exe = std::env::args().nth(1);
+    let exe = std::env::args().nth(1).filter(|e| !e.is_empty());
     let model = std::env::args().nth(2).filter(|m| m.contains('/'));
     let prompt = std::env::args()
         .nth(3)
