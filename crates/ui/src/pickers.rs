@@ -13,7 +13,7 @@
 
 mod compact;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -643,9 +643,20 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     model_refresh_errors: HashMap<HarnessId, String>,
+    /// The loaded harness list belongs to the previous device: reload it
+    /// once, keeping its rows on screen meanwhile (see the state observer).
+    harnesses_stale: bool,
+    /// Loaded model slots from the previous device, each reloaded once
+    /// through the engine's cache while its rows stay on screen.
+    stale_models: HashSet<HarnessId>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
+    /// The previous project's resolved ref, shown ONLY by the checkout and
+    /// branch chip labels until this project's refs land — so a project
+    /// switch never blinks them through "Select ref". Never read by the
+    /// popover or the send plan.
+    held_ref: Option<RepoRef>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view.
@@ -780,22 +791,34 @@ impl Pickers {
             // (and possibly the device) changed under them.
             let space = state.read(cx).selected_space.clone();
             let device = state.read(cx).effective_device_id();
-            if space != this.space_owner || device != this.device_owner {
+            let device_changed = device != this.device_owner;
+            if space != this.space_owner || device_changed {
                 this.space_owner = space;
                 this.device_owner = device;
-                this.target_generation = this.target_generation.wrapping_add(1);
                 this.setting_menu = None;
                 this.setting_bounds = None;
+                this.held_ref = this.selected_ref().cloned().or(this.held_ref.take());
                 this.refs_task = None;
-                this.load_task = None;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
-                // Catalogs are per-DEVICE (fetched from the space's host):
-                // a space switch may land on another device, so refetch.
-                this.harnesses = Loadable::Idle;
-                this.models.clear();
+            }
+            // Catalogs are per-DEVICE (fetched from the space's host), so a
+            // project switch on the same device keeps them. A device switch
+            // revalidates against the new host with the loaded rows still on
+            // screen, so the model chip never blanks; in-flight loads for
+            // the old host are discarded by the generation bump and restart.
+            if device_changed {
+                this.target_generation = this.target_generation.wrapping_add(1);
+                this.load_task = None;
+                if matches!(this.harnesses, Loadable::Ready(_)) {
+                    this.harnesses_stale = true;
+                } else {
+                    this.harnesses = Loadable::Idle;
+                }
+                this.models.retain(|_, slot| matches!(slot, Loadable::Ready(_)));
+                this.stale_models = this.models.keys().copied().collect();
                 this.model_refresh_errors.clear();
                 this.catalog_rev += 1;
             }
@@ -877,8 +900,11 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             model_refresh_errors: HashMap::new(),
+            harnesses_stale: false,
+            stale_models: HashSet::new(),
             refs: Loadable::Idle,
             refs_space: None,
+            held_ref: None,
             active: 0,
             model_scroll: gpui::UniformListScrollHandle::new(),
             model_rows_cache: std::cell::RefCell::new(None),
@@ -1398,7 +1424,7 @@ impl Pickers {
         let reload = match self.harnesses {
             Loadable::Idle => true,
             Loadable::Loading => false,
-            Loadable::Ready(_) | Loadable::Error(_) => force,
+            Loadable::Ready(_) | Loadable::Error(_) => force || self.harnesses_stale,
         };
         if !reload {
             return;
@@ -1406,6 +1432,7 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        self.harnesses_stale = false;
         let target = self.space_target(cx);
         let generation = self.target_generation;
         if !matches!(self.harnesses, Loadable::Ready(_)) {
@@ -1475,7 +1502,9 @@ impl Pickers {
         let reload = match self.models.get(&harness) {
             None | Some(Loadable::Idle) => true,
             Some(Loadable::Loading) => false,
-            Some(Loadable::Ready(_)) | Some(Loadable::Error(_)) => force,
+            Some(Loadable::Ready(_)) | Some(Loadable::Error(_)) => {
+                force || self.stale_models.contains(&harness)
+            }
         };
         if !reload {
             return;
@@ -1483,6 +1512,7 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        self.stale_models.remove(&harness);
         let target = self.space_target(cx);
         let generation = self.target_generation;
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
@@ -1640,6 +1670,7 @@ impl Pickers {
                 .call(methods::LIST_REFS, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                pickers.held_ref = None;
                 pickers.refs = match result {
                     Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
                         Ok(refs) => Loadable::Ready(refs),
@@ -2247,6 +2278,20 @@ impl Pickers {
             .or_else(|| self.selected_ref().map(|r| r.name.clone()))
     }
 
+    /// The ref the checkout and branch chips name: the resolved one, else —
+    /// while a project switch's refs load — the previous project's.
+    fn display_ref(&self) -> Option<&RepoRef> {
+        match self.refs {
+            Loadable::Idle | Loadable::Loading => self.selected_ref().or(self.held_ref.as_ref()),
+            _ => self.selected_ref(),
+        }
+    }
+
+    fn display_ref_is_worktree(&self) -> bool {
+        self.display_ref()
+            .is_some_and(|row| row.worktree_path.is_some())
+    }
+
     /// The existing worktree the picked ref is materialized in, if any.
     fn selected_ref_worktree(&self) -> Option<String> {
         self.selected_ref().and_then(|r| r.worktree_path.clone())
@@ -2276,7 +2321,7 @@ impl Pickers {
         match self.config.checkout {
             CheckoutKind::NewWorktree => "New worktree",
             CheckoutKind::Local => {
-                if self.selected_ref_worktree().is_some() {
+                if self.display_ref_is_worktree() {
                     "Current worktree"
                 } else {
                     "Current checkout"
@@ -2288,7 +2333,12 @@ impl Pickers {
     /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
     /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
     fn ref_label(&self) -> SharedString {
-        match (self.config.checkout, self.effective_ref_name()) {
+        let name = self
+            .config
+            .branch
+            .clone()
+            .or_else(|| self.display_ref().map(|row| row.name.clone()));
+        match (self.config.checkout, name) {
             (_, None) => SharedString::from("Select ref"),
             (CheckoutKind::NewWorktree, Some(name)) => SharedString::from(format!("From {name}")),
             (CheckoutKind::Local, Some(name)) => SharedString::from(name),
@@ -3408,7 +3458,7 @@ impl Pickers {
             }
             _ => None,
         };
-        let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
+        let kind_icon = match (self.config.checkout, self.display_ref_is_worktree()) {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
             _ => crate::icons::WORKTREE,
         };
@@ -3573,7 +3623,7 @@ impl Pickers {
             &theme,
             cx,
         );
-        let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
+        let kind_icon = match (self.config.checkout, self.display_ref_is_worktree()) {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
             _ => crate::icons::WORKTREE,
         };
@@ -7053,7 +7103,132 @@ mod tests {
             assert_eq!(pickers.space_target(cx).as_deref(), Some("remote"));
             // Projects list across devices; the opt-out row stays picked.
             assert_eq!(pickers.selected_project_index(cx), 1);
-            assert!(pickers.target_generation >= 2);
+            // Only the device switch re-targets the per-device catalogs; the
+            // same-device projectless pick kept them.
+            assert_eq!(pickers.target_generation, 1);
+        });
+    }
+
+    fn git_space(id: &str, device: &str) -> Space {
+        Space {
+            id: id.into(),
+            device_id: device.into(),
+            path: format!("/{device}/{id}"),
+            name: None,
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn repo_ref(name: &str, current: bool, worktree: Option<&str>) -> RepoRef {
+        RepoRef {
+            name: name.into(),
+            current,
+            worktree_path: worktree.map(str::to_string),
+        }
+    }
+
+    #[gpui::test]
+    fn project_switch_on_one_device_keeps_the_model_catalog(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "local")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults = ComposerDefaults::default();
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(vec![bare_model("gpt", "GPT")]),
+                cx,
+            );
+            assert_eq!(pickers.model_name(cx), ModelName::Named("GPT".into()));
+        });
+        state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            // Same host: the catalog stands, the chip never blanks.
+            assert_eq!(pickers.model_name(cx), ModelName::Named("GPT".into()));
+            assert!(matches!(pickers.harnesses, Loadable::Ready(_)));
+            assert!(!pickers.harnesses_stale && pickers.stale_models.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn device_switch_revalidates_the_catalog_without_blanking(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "remote")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults = ComposerDefaults::default();
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(vec![bare_model("gpt", "GPT")]),
+                cx,
+            );
+            pickers.models.insert(HarnessId::ClaudeCode, Loadable::Loading);
+        });
+        state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            // Old rows stay on screen, marked for one reload from the new host;
+            // a load in flight for the old host restarts instead.
+            assert_eq!(pickers.model_name(cx), ModelName::Named("GPT".into()));
+            assert!(pickers.harnesses_stale);
+            assert_eq!(pickers.stale_models, HashSet::from([HarnessId::Codex]));
+            assert!(!pickers.models.contains_key(&HarnessId::ClaudeCode));
+        });
+    }
+
+    #[gpui::test]
+    fn project_switch_holds_the_ref_labels_until_refs_land(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "local")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, _| {
+            pickers.refs = Loadable::Ready(vec![
+                repo_ref("main", false, None),
+                repo_ref("feature", true, Some("/wt/feature")),
+            ]);
+            pickers.refs_space = Some("a".into());
+            assert_eq!(pickers.ref_label(), SharedString::from("feature"));
+            assert_eq!(pickers.checkout_label(), "Current worktree");
+        });
+        state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            // The chips keep naming the last ref while b's refs load...
+            assert!(matches!(pickers.refs, Loadable::Idle));
+            assert_eq!(pickers.ref_label(), SharedString::from("feature"));
+            assert_eq!(pickers.checkout_label(), "Current worktree");
+            // ...but nothing that acts on refs sees a's rows.
+            assert!(pickers.filtered_ref_rows(cx).is_empty());
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::CurrentCheckout { branch: None }
+            );
+            pickers.refs = Loadable::Ready(vec![repo_ref("trunk", true, None)]);
+            pickers.held_ref = None; // as the refs load does on landing
+            assert_eq!(pickers.ref_label(), SharedString::from("trunk"));
+            assert_eq!(pickers.checkout_label(), "Current checkout");
         });
     }
 
