@@ -13,6 +13,7 @@
 
 mod compact;
 
+use crate::roll_text::{roll_text, rolling};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -3215,13 +3216,21 @@ impl Pickers {
                 },
             )
             .when(label_loading, |el| {
+                // Nothing is named on screen: the label rolls in from empty.
+                rolling(format!("{id}-label"), SharedString::default(), true);
                 el.child(popover::skeleton_bar(56.0, cx.entity_id(), cx))
             })
             .when(!label_loading, |el| {
-                el.child(if resizing {
-                    resizing_chip_text(format!("{id}-label").into(), 1.0, None, label)
-                } else {
-                    div().min_w_0().truncate().child(label).into_any_element()
+                // A changing label rolls (Scritto-style); at rest it is the
+                // plain truncating label, or the clip-don't-ellipsize variant
+                // while the model chip's width glides.
+                let rolling = rolling(format!("{id}-label"), label.clone(), cx.reduce_motion());
+                el.child(match rolling {
+                    Some(rolling) => rolling,
+                    None if resizing => {
+                        resizing_chip_text(format!("{id}-label").into(), 1.0, None, label)
+                    }
+                    None => div().min_w_0().truncate().child(label).into_any_element(),
                 })
             })
             // The effort half of the combined model+effort chip (and the space
@@ -3231,7 +3240,16 @@ impl Pickers {
             // model name — the run's identity — truncates last.
             .when_some(suffix, |el, (suffix, tint)| {
                 let color = tint.unwrap_or(theme.text_muted.opacity(0.7));
-                el.child(if resizing {
+                let rolling = rolling(format!("{id}-suffix"), suffix.clone(), cx.reduce_motion());
+                el.child(if let Some(rolling) = rolling {
+                    div()
+                        .flex()
+                        .flex_shrink(1000.0)
+                        .min_w_0()
+                        .text_color(color)
+                        .child(rolling)
+                        .into_any_element()
+                } else if resizing {
                     resizing_chip_text(format!("{id}-suffix").into(), 1000.0, Some(color), suffix)
                 } else {
                     div()
@@ -3299,7 +3317,7 @@ impl Pickers {
                     .flex_none()
                     .text_color(theme.text_muted.opacity(0.7)),
             )
-            .child(div().min_w_0().truncate().child(label))
+            .child(roll_text(format!("{id}-label"), label, cx.reduce_motion()))
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))

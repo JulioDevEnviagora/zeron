@@ -987,13 +987,19 @@ impl Pickers {
                 this.show_compact_models(cx);
             }))
             .when(!levels.is_empty(), |el| {
+                // The slider retitles the panel as it drags; the level name
+                // rolls between values like the composer chips.
                 el.child(
                     div()
                         .text_size(crate::typography::ui_rems(14.0))
                         .line_height(px(17.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(effort.clone()),
+                        .child(crate::roll_text::roll_text(
+                            format!("compact-effort-title-{}", cx.entity_id()),
+                            effort.clone(),
+                            reduced,
+                        )),
                 )
             })
             .child(

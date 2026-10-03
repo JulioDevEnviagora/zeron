@@ -6541,6 +6541,7 @@ impl Transcript {
                     cx,
                 ))
                 .child(
+                    // The flavour word rotates every 7s; roll it as it turns.
                     div()
                         .text_size(crate::typography::ui_rems(12.0))
                         .text_color(if queued {
@@ -6548,19 +6549,29 @@ impl Transcript {
                         } else {
                             theme.text_muted
                         })
-                        .child(SharedString::from(if queued {
-                            word.to_string()
-                        } else {
-                            format!("{word}…")
-                        })),
+                        .child(crate::roll_text::roll_text(
+                            format!("working-word-{}", cx.entity_id()),
+                            SharedString::from(if queued {
+                                word.to_string()
+                            } else {
+                                format!("{word}…")
+                            }),
+                            cx.reduce_motion(),
+                        )),
                 )
                 .when(!sending, |el| {
+                    // The timer ticks every second; its digits roll in place
+                    // (the unit suffix holds).
                     el.child(
                         div()
                             .relative()
                             .top(px(1.0))
                             .text_color(theme.text_faint)
-                            .child(SharedString::from(format_elapsed(elapsed_secs))),
+                            .child(crate::roll_text::roll_text(
+                                format!("working-timer-{}", cx.entity_id()),
+                                SharedString::from(format_elapsed(elapsed_secs)),
+                                cx.reduce_motion(),
+                            )),
                     )
                 })
                 .into_any_element(),
