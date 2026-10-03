@@ -243,8 +243,28 @@ pub fn offered_options(
 // Pure: folder-browser navigation (used by the shell's add-space flow)
 // ---------------------------------------------------------------------------
 
+/// Whether `path` is drive-rooted (`C:`, `C:\…`, `C:/…`). Judged by shape,
+/// not `cfg`: the device being browsed may be a Windows machine reached from
+/// any platform.
+fn is_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes.get(2).is_none_or(|b| matches!(b, b'/' | b'\\'))
+}
+
 /// Parent of an absolute path; `None` at the filesystem root.
 pub fn parent_path(path: &str) -> Option<String> {
+    if is_windows_path(path) {
+        let (drive, rest) = path.split_at(2);
+        let rest = rest.trim_matches(['/', '\\']);
+        if rest.is_empty() {
+            return None; // drive root
+        }
+        let parent = rest.rfind(['/', '\\']).map_or("", |at| &rest[..at]);
+        return Some(format!("{drive}\\{parent}"));
+    }
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return None; // was "/" (or empty)
@@ -258,8 +278,10 @@ pub fn parent_path(path: &str) -> Option<String> {
 
 /// Join a listing path and an entry name.
 pub fn child_path(base: &str, name: &str) -> String {
-    if base.ends_with('/') {
+    if base.ends_with(['/', '\\']) {
         format!("{base}{name}")
+    } else if is_windows_path(base) {
+        format!("{base}\\{name}")
     } else {
         format!("{base}/{name}")
     }
@@ -304,13 +326,29 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
     hits.next().is_none().then_some(ix)
 }
 
-/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
-/// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
-/// trailing slash trimmed. `home` is the device's resolved home — `None`
-/// until the first listing lands, when `~` can't expand yet. A query like
-/// `~foo` is a folder name, not a path.
+/// Whether a palette query is path-shaped (absolute, home-relative or
+/// drive-rooted) rather than a folder name to filter by.
+pub fn is_typed_path(query: &str) -> bool {
+    query.starts_with(['/', '~']) || is_windows_path(query)
+}
+
+/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`),
+/// drive-rooted (`D:\projects`) or home-relative (`~`, `~/github`). Returns the
+/// absolute path to browse, trailing separator trimmed. `home` is the device's
+/// resolved home — `None` until the first listing lands, when `~` can't expand
+/// yet. A query like `~foo` is a folder name, not a path.
 pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
     let query = query.trim();
+    if is_windows_path(query) {
+        let path = query.replace('/', "\\");
+        let trimmed = path.trim_end_matches('\\');
+        // `D:` and `D:\` both mean the drive root.
+        return Some(if trimmed.len() == 2 {
+            format!("{trimmed}\\")
+        } else {
+            trimmed.to_string()
+        });
+    }
     if let Some(rest) = query.strip_prefix('~') {
         let home = home?.trim_end_matches('/');
         if rest.is_empty() {
@@ -336,10 +374,17 @@ pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
 
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
-    let mut acc = String::new();
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        acc.push('/');
+    let (drive, sep, rest) = if is_windows_path(path) {
+        let (drive, rest) = path.split_at(2);
+        (drive, '\\', rest)
+    } else {
+        ("", '/', path)
+    };
+    let root = format!("{drive}{sep}");
+    let mut out = vec![(root.clone(), root)];
+    let mut acc = drive.to_string();
+    for segment in rest.split(['/', sep]).filter(|s| !s.is_empty()) {
+        acc.push(sep);
         acc.push_str(segment);
         out.push((segment.to_string(), acc.clone()));
     }
@@ -8389,13 +8434,16 @@ mod tests {
                     Loadable::Ready(vec![bare_model("claude", "Claude model")]),
                 );
                 picker.catalog_rev += 1;
-                // The list holds one provider's models; the provider page
-                // switches to the newly loaded one.
-                assert_eq!(picker.model_rows_len(cx), 1);
-                picker.pick_compact_provider(HarnessId::ClaudeCode, cx);
+                // A provider's models become directly selectable when its
+                // catalog finishes loading; no provider-page detour is needed.
+                assert_eq!(picker.model_rows_len(cx), 2);
+                assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
+                picker.activate_model_index(1, cx);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude"));
                 picker.show_compact_models(cx);
-                assert_eq!(picker.model_rows_len(cx), 1);
-                assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
+                assert_eq!(picker.model_rows_len(cx), 2);
+                assert_eq!(picker.model_rows(cx)[picker.active].harness, HarnessId::ClaudeCode);
             })
             .unwrap();
     }
@@ -8563,10 +8611,25 @@ mod tests {
             .update(cx, |picker, window, cx| {
                 picker.open_model_menu(window, cx);
                 assert!(!picker.compact_model_list);
-                // The list holds the current provider's models only.
+                // Models from every offered provider are directly selectable.
                 picker.show_compact_models(cx);
-                assert_eq!(picker.model_rows_len(cx), 1);
+                assert_eq!(picker.model_rows_len(cx), 2);
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::Codex);
+                assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
+                // Searching must also find another provider's model.
+                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                assert_eq!(picker.model_rows_len(cx), 1);
+                assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
+                picker.activate_model_index(0, cx);
+                assert!(!picker.compact_model_list);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude-model"));
+                picker.pick_harness(HarnessId::Codex, cx);
+                // Clicking a foreign-provider row works without a search too.
+                picker.show_compact_models(cx);
+                picker.activate_model_index(1, cx);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                picker.pick_harness(HarnessId::Codex, cx);
                 // The provider page lists every provider, highlighting the
                 // current one, and a pick lands back on the panel.
                 picker.show_compact_providers(cx);
@@ -8588,6 +8651,9 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.rail_descriptors(cx)[0].id, HarnessId::Codex);
+                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                assert_eq!(picker.model_rows_len(cx), 0);
+                picker.search.update(cx, |input, cx| input.set_text("", cx));
                 // A chat's provider is fixed: the provider page stays shut.
                 picker.compact_model_list = false;
                 picker.show_compact_providers(cx);
@@ -8927,6 +8993,28 @@ mod tests {
     }
 
     #[test]
+    fn windows_folder_paths_and_breadcrumbs() {
+        assert_eq!(
+            parent_path(r"D:\Random\zeron"),
+            Some(r"D:\Random".to_string())
+        );
+        assert_eq!(parent_path(r"D:\Random"), Some(r"D:\".to_string()));
+        assert_eq!(parent_path(r"D:\Random\"), Some(r"D:\".to_string()));
+        assert_eq!(parent_path(r"D:\"), None);
+        assert_eq!(parent_path("D:"), None);
+        assert_eq!(child_path(r"D:\", "Random"), r"D:\Random");
+        assert_eq!(child_path(r"D:\Random", "zeron"), r"D:\Random\zeron");
+        let crumbs = breadcrumbs(r"D:\Random\zeron");
+        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, [r"D:\", "Random", "zeron"]);
+        assert_eq!(crumbs[0].1, r"D:\");
+        assert_eq!(crumbs[1].1, r"D:\Random");
+        assert_eq!(breadcrumbs(r"D:\").len(), 1);
+        assert!(!is_windows_path("/D:/x"));
+        assert!(!is_windows_path("ab:/x"));
+    }
+
+    #[test]
     fn completion_prefix_lengths() {
         // Case-insensitive; the length indexes into the NAME's bytes.
         assert_eq!(completion_prefix_len("Documents", "doc"), Some(3));
@@ -8976,6 +9064,26 @@ mod tests {
         // `~` can't expand before the device's home is known.
         assert_eq!(typed_path_target("~/github", None), None);
         assert_eq!(typed_path_target("/disk2", None), Some("/disk2".into()));
+    }
+
+    #[test]
+    fn typed_path_target_accepts_windows_drive_paths() {
+        let home = Some(r"C:\Users\wing");
+        assert_eq!(typed_path_target(r"D:\", home), Some(r"D:\".into()));
+        assert_eq!(typed_path_target("D:", home), Some(r"D:\".into()));
+        assert_eq!(typed_path_target("D:/", home), Some(r"D:\".into()));
+        assert_eq!(
+            typed_path_target(r"D:\Random\zeron\", home),
+            Some(r"D:\Random\zeron".into())
+        );
+        // Forward slashes normalise so the crumb trail can match the path.
+        assert_eq!(
+            typed_path_target("D:/Random/zeron", None),
+            Some(r"D:\Random\zeron".into())
+        );
+        assert!(is_typed_path(r"D:\x"));
+        assert!(is_typed_path("/x") && is_typed_path("~"));
+        assert!(!is_typed_path("src") && !is_typed_path("ab:/x"));
     }
 
     #[test]
