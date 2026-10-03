@@ -3410,7 +3410,7 @@ impl Pickers {
         };
         let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
-            _ => crate::icons::FOLDER_WITH_FILES,
+            _ => crate::icons::WORKTREE,
         };
         let checkout_chip = self.footer_chip(
             PickerKind::Checkout,
@@ -3490,7 +3490,7 @@ impl Pickers {
             };
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
             let (icon_path, label) = if is_worktree {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
+                (crate::icons::WORKTREE, "Worktree")
             } else {
                 (crate::icons::FOLDER, "Local checkout")
             };
@@ -3575,7 +3575,7 @@ impl Pickers {
         );
         let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
-            _ => crate::icons::FOLDER_WITH_FILES,
+            _ => crate::icons::WORKTREE,
         };
         let kind_chip = self.footer_chip(
             PickerKind::Checkout,
@@ -3934,7 +3934,7 @@ impl Pickers {
             "Current checkout"
         };
         let local_icon = if has_worktree {
-            crate::icons::FOLDER_WITH_FILES
+            crate::icons::WORKTREE
         } else {
             crate::icons::FOLDER
         };
@@ -3943,7 +3943,7 @@ impl Pickers {
             (
                 CheckoutKind::NewWorktree,
                 "New worktree",
-                crate::icons::FOLDER_WITH_FILES,
+                crate::icons::WORKTREE,
             ),
         ];
         let active = self.active;

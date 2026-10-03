@@ -6475,9 +6475,19 @@ impl Shell {
                     .h_full()
                     .w(px(caption_buttons_width(self.linux_left_caption_count())))
             }))
-            .child(window_control_button(
+            .child(window_control_button_with(
                 "toggle-sidebar",
-                icons::SIDEBAR_MINIMALISTIC_LEFT,
+                icons::sidebar_glyph(
+                    motion::state_t(
+                        "toggle-sidebar",
+                        !self.settings.sidebar_collapsed,
+                        motion::GLYPH_STATE,
+                        self.reduced_motion,
+                    ),
+                    false,
+                    16.0,
+                    theme.text_muted,
+                ),
                 ShortcutId::ToggleSidebar.label(),
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
@@ -12145,7 +12155,19 @@ fn window_control_button(
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let muted = theme.text_muted;
+    let glyph = icon(icon_path).size(px(16.0)).text_color(theme.text_muted);
+    window_control_button_with(id, glyph, label, theme, on_click)
+}
+
+/// [`window_control_button`] around a caller-drawn glyph (the morphing
+/// sidebar glyph).
+fn window_control_button_with(
+    id: &'static str,
+    glyph: impl IntoElement,
+    label: &'static str,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let fade_key = format!("window-control-{id}");
     div()
         .id(id)
@@ -12182,7 +12204,7 @@ fn window_control_button(
             on_click(event, window, cx)
         })
         .tooltip(crate::settings::widgets::text_tooltip(label))
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
+        .child(glyph)
 }
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
@@ -12331,7 +12353,18 @@ fn header_icon_button(
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    let muted = theme.text_muted;
+    let glyph = icon(icon_path).size(px(16.0)).text_color(theme.text_muted);
+    header_icon_button_with(id, glyph, label, on_click)
+}
+
+/// [`header_icon_button`] around a caller-drawn glyph (the morphing sidebar
+/// glyph).
+fn header_icon_button_with(
+    id: &'static str,
+    glyph: impl IntoElement,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
     let fade_key = format!("header-icon-{id}");
     div()
         .id(id)
@@ -12359,7 +12392,7 @@ fn header_icon_button(
             on_click(event, window, cx)
         })
         .tooltip(crate::settings::widgets::text_tooltip(label))
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
+        .child(glyph)
 }
 
 impl Render for Shell {
@@ -13057,7 +13090,8 @@ impl Render for Shell {
         // scheduling `with_animation` would have requested). Hover color fades
         // ride the same clock; their once-per-frame tick lives here (this is
         // the window's root render — it runs exactly once per frame).
-        if self.motion_active.get() | motion::hover_fades_active() {
+        if self.motion_active.get() | motion::hover_fades_active() | motion::state_morphs_active()
+        {
             window.request_animation_frame();
         }
 

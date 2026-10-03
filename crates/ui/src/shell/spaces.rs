@@ -3900,7 +3900,7 @@ impl Shell {
     }
 
     /// The sidebar's space-filter row: current filter ("All projects" or the
-    /// space's name) + chevron, the dropdown floating beneath while open.
+    /// space's name), the dropdown floating beneath while open.
     /// Sits OUTSIDE the sidebar's scroll region so the float never clips.
     pub(super) fn render_spaces_filter(
         &mut self,
@@ -3973,9 +3973,8 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_muted),
             )
-            // flex_1 pushes the caret to the trigger's right edge and gives
-            // long space names a bound to fade against; the "@ device"
-            // tag hugs the name inside it rather than sitting by the caret.
+            // flex_1 gives long space names a bound to fade against; the
+            // "@ device" tag hugs the name inside it.
             .child(
                 div()
                     .flex_1()
@@ -4009,12 +4008,6 @@ impl Shell {
                             )
                         })
                     }),
-            )
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(14.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.6)),
             );
         let trigger = if self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
