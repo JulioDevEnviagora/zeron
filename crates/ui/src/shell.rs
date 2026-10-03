@@ -7732,22 +7732,33 @@ impl Shell {
                                 .text_color(subline),
                         )
                     })
-                    .when(
-                        if compact {
-                            remote || corner_hovered
-                        } else {
-                            !show_label
-                        },
-                        |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_color(subline)
-                                    .children(corner.take()),
-                            )
-                        },
-                    )
+                    .when(!compact && !show_label, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_color(subline)
+                                .children(corner.take()),
+                        )
+                    })
+                    // Compact trailing cluster, right-packed: the PR badge sits
+                    // LEFT of one fixed slot that shows the relative time, swaps
+                    // to the archive affordance while the row is hovered, and
+                    // shows the Cmd+N jump legend while the modifier is held.
+                    // The legend wins over the hover archive (user request).
+                    // There is no remote globe — the slot's fixed width keeps
+                    // the column aligned across rows regardless of a PR badge.
                     .when(compact, |el| {
+                        // Cmd-held legend beats the hover archive; preview rows
+                        // (the palette) never archive.
+                        let show_legend = compact_jump_label.is_some();
+                        let show_archive = corner_hovered && !show_legend && !preview;
+                        // The slot is 30px (holds "17m"); a text-length jump
+                        // hint widens it to a floor so "Ctrl+1" vs "Ctrl+2"
+                        // never nudges the column.
+                        let text_hint = compact_jump_label
+                            .as_ref()
+                            .is_some_and(|label| label.chars().count() > 3);
+                        let archive_id = id.clone();
                         el.children(change_request.clone().map(|summary| {
                             if preview {
                                 crate::change_requests::pull_request_badge_preview(
@@ -7765,22 +7776,9 @@ impl Shell {
                                 )
                             }
                         }))
-                    })
-                    .when(compact, |el| {
-                        // The time slot is 30px, which holds "17m" but not
-                        // "Ctrl+2": unwrapped, the hint broke after the `+`
-                        // and stacked two lines. A text-length hint keeps one
-                        // line in a wider slot — a floor, not content sized,
-                        // so "Ctrl+1" (a narrower glyph) doesn't nudge its
-                        // row's badge off the others'. The floor scales with
-                        // the UI font like the text does, and a longer
-                        // rebound combo grows the slot instead of spilling
-                        // over the title.
-                        let text_hint = compact_jump_label
-                            .as_ref()
-                            .is_some_and(|label| label.chars().count() > 3);
-                        el.child(
+                        .child(
                             div()
+                                .id(SharedString::from(format!("{row_id}-corner")))
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
@@ -7789,12 +7787,59 @@ impl Shell {
                                     el.min_w(crate::typography::ui_rems(COMPACT_JUMP_HINT_WIDTH))
                                 })
                                 .when(!text_hint, |el| el.w(px(30.0)))
+                                // Fixed height so swapping the time text for the
+                                // archive glyph never resizes the slot.
+                                .h(px(14.0))
                                 .flex_none()
-                                .whitespace_nowrap()
-                                .text_right()
-                                .text_size(crate::typography::ui_rems(11.0))
-                                .text_color(subline)
-                                .child(compact_jump_label.unwrap_or(time_ago)),
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .aria_label(if show_archive {
+                                    if archived { "Unarchive" } else { "Archive" }
+                                } else {
+                                    "Session time"
+                                })
+                                .when(show_archive, |el| {
+                                    el.cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.chat_hover_resync = true;
+                                            this.set_chat_archived(
+                                                archive_id.clone(),
+                                                !archived,
+                                                cx,
+                                            );
+                                        }))
+                                        .tooltip(crate::settings::widgets::text_tooltip_above(
+                                            if archived {
+                                                "Unarchive session"
+                                            } else {
+                                                ShortcutId::ArchiveSession.label()
+                                            },
+                                        ))
+                                })
+                                .child(if show_archive {
+                                    icon(if archived {
+                                        icons::ARCHIVE_UP_MINIMALISTIC
+                                    } else {
+                                        icons::ARCHIVE_MINIMALISTIC
+                                    })
+                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                    .flex_none()
+                                    .text_color(theme.text_muted)
+                                    .into_any_element()
+                                } else {
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_right()
+                                        .text_size(crate::typography::ui_rems(11.0))
+                                        .text_color(subline)
+                                        .child(compact_jump_label.unwrap_or(time_ago))
+                                        .into_any_element()
+                                }),
                         )
                     }),
             )

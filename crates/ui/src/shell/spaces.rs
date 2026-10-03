@@ -1314,7 +1314,10 @@ mod pinned_session_tests {
             let row = cx.debug_bounds("chat-older").unwrap();
             let title = cx.debug_bounds("chat-title-older").unwrap();
             cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
-            assert!(cx.debug_bounds("chat-title-older").unwrap().size.width < title.size.width);
+            // The globe/archive slot is always reserved, so hovering swaps its
+            // glyph in place: the title keeps its width and the status and time
+            // columns never move.
+            assert_eq!(cx.debug_bounds("chat-title-older").unwrap().size.width, title.size.width);
             assert_eq!(cx.debug_bounds("chat-status-older").unwrap(), status);
             assert_eq!(cx.debug_bounds("chat-time-older").unwrap(), time);
         }
@@ -1770,11 +1773,11 @@ mod pinned_session_tests {
 
         let row = cx.debug_bounds("chat-a").unwrap();
         cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
-        let pointer = cx.debug_bounds("chat-a-corner").unwrap().center();
+        let pointer = cx.debug_bounds("chat-time-a").unwrap().center();
         cx.simulate_mouse_move(pointer, None, gpui::Modifiers::default());
         for (archived, next) in [
-            ("a", Some(("b", "chat-b-corner"))),
-            ("b", Some(("c", "chat-c-corner"))),
+            ("a", Some(("b", "chat-time-b"))),
+            ("b", Some(("c", "chat-time-c"))),
             ("c", None),
         ] {
             cx.simulate_click(pointer, gpui::Modifiers::default());
