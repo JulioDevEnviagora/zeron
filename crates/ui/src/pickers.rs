@@ -6093,10 +6093,9 @@ impl Render for Pickers {
             ),
         };
         // The chip names the model and its effort only; the other options
-        // (context, fast mode, ...) live in the popover. The effort brightens
-        // when it departs from the model's default.
+        // (context, fast mode, ...) live in the popover. The effort always
+        // reads in the muted second tone, default or not (user request).
         let effort = self.effective_reasoning(cx);
-        let effort_customized = effort != default_reasoning(&self.trait_ladder(cx));
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see
         // `render_footer`), not here.
@@ -6125,12 +6124,7 @@ impl Render for Pickers {
         // None for the title picker (titles always run at minimal reasoning).
         let chip_suffix = effort
             .filter(|_| self.title.is_none())
-            .map(|level| {
-                (
-                    SharedString::from(reasoning_label(level)),
-                    effort_customized.then(|| theme.text.opacity(0.85)),
-                )
-            })
+            .map(|level| (SharedString::from(reasoning_label(level)), None))
             .or_else(|| {
                 self.title
                     .is_none()
