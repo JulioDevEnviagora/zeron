@@ -1123,7 +1123,9 @@ impl Pickers {
         if let Some(label) = self.selected_model_label(cx) {
             return ModelName::Named(label.into());
         }
-        let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        // A list still from the previous device is loading for this one.
+        let catalog_loading = self.harnesses_stale
+            || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         let models_loading = self.effective_harness(cx).is_some_and(|harness| {
             !matches!(
                 self.models.get(&harness),
@@ -6125,7 +6127,9 @@ impl Render for Pickers {
                 ModelName::Loading | ModelName::None { .. } => SharedString::default(),
             }
         };
-        let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        // A list still from the previous device is loading for this one.
+        let catalog_loading = self.harnesses_stale
+            || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         // Harness unknown while the catalog resolves: the pixel-glyph loader
         // instead of guessing a brand mark.
         let chip_icon_loading = self.title.is_none()
@@ -7241,7 +7245,7 @@ mod tests {
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         pickers.update(cx, |pickers, cx| {
             pickers.defaults = ComposerDefaults::default();
-            // Real use always has a picked or remembered harness.
+            // A picked harness keeps the chip naming its model throughout.
             pickers.config.harness = Some(HarnessId::Codex);
             pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
             pickers.apply_model_catalog(
@@ -7283,6 +7287,8 @@ mod tests {
             assert!(pickers.harnesses_stale);
             assert_eq!(pickers.effective_harness(cx), None);
             assert_eq!(pickers.resolved(cx).harness, None);
+            // ...and the chip reads as loading, never blank.
+            assert_eq!(pickers.model_name(cx), ModelName::Loading);
         });
     }
 

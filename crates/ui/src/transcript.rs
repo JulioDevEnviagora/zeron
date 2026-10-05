@@ -6486,8 +6486,8 @@ impl Transcript {
                 // with no timer instead; the word + timer start with the
                 // turn.
                 let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-                let sending =
-                    sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+                let send_started = state.pending_send_started(&chat_id, now);
+                let sending = sending_bridge(send_started, turn_started);
                 // Degraded delivery path: the send is a durable local write
                 // waiting on connectivity — say so instead of faking
                 // progress. (The overlay holds while degraded, so this line
@@ -6496,7 +6496,11 @@ impl Transcript {
                 let elapsed = turn_started
                     .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                     .unwrap_or(0);
-                let turn = turn_started.map_or(0, |t| t.timestamp_millis());
+                // While sending, the session row still carries the PREVIOUS
+                // turn: the bridge keys on its own send instead, so it never
+                // rolls out of that turn's word or an earlier send's.
+                let turn = if sending { send_started } else { turn_started }
+                    .map_or(0, |t| t.timestamp_millis());
                 (sending, queued, elapsed, turn)
             };
             (sending, queued, elapsed, flavour_seed(&chat_id), turn)
@@ -6554,14 +6558,7 @@ impl Transcript {
                             theme.text_muted
                         })
                         .child(crate::roll_text::roll_text(
-                            // While sending, the session row still carries the
-                            // PREVIOUS turn: key the bridge on its own so it
-                            // never rolls out of that turn's last word.
-                            if sending {
-                                format!("working-word-{}-sending", cx.entity_id())
-                            } else {
-                                format!("working-word-{}-{turn}", cx.entity_id())
-                            },
+                            format!("working-word-{}-{turn}", cx.entity_id()),
                             SharedString::from(if queued {
                                 word.to_string()
                             } else {
