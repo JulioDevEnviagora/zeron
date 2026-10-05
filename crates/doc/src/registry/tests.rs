@@ -588,7 +588,10 @@ fn spaces_round_trip_and_mutate() {
     assert_eq!(row.git_checked_at, Some(ts(4_000)));
 
     assert!(!ws.rename_space("nope", Some("x")).unwrap());
-    assert!(!ws.set_space_git("nope", true, None, None, None, ts(1)).unwrap());
+    assert!(
+        !ws.set_space_git("nope", true, None, None, None, ts(1))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1528,4 +1531,28 @@ fn side_chat_origin_syncs_and_survives_updates_and_restart() {
             .as_deref(),
         Some("main")
     );
+}
+
+#[test]
+fn a_deleted_device_row_reads_as_deleted_not_unknown() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_device(&device("laptop", "Laptop")).unwrap();
+    assert!(!ws.device_deleted("laptop"));
+    assert!(!ws.device_deleted("never-heard-of"));
+    // The edge tombstones a deleted Cloud session's device.
+    let _ = ws.apply_rows(
+        1,
+        vec![RegistryRow::tombstone(
+            KIND_DEVICES,
+            "cloud-1",
+            hlc_by(5_000, "cloud-edge"),
+        )],
+    );
+    assert!(ws.device_deleted("cloud-1"));
+    assert!(ws.read_devices().unwrap().iter().all(|d| d.id != "cloud-1"));
+    // A device that comes back revives its row.
+    let mut back = device("cloud-1", "Cloud session");
+    back.last_seen_at = Some(ts(9_000));
+    ws.upsert_device(&back).unwrap();
+    assert!(!ws.device_deleted("cloud-1"));
 }

@@ -654,6 +654,11 @@ impl RegistryDoc {
 
     /// The row as this device should display it: authoritative + pending ops.
     fn overlay_row(&self, kind: &str, id: &str) -> Option<RegistryRow> {
+        self.overlay_row_or_tombstone(kind, id)
+            .filter(|r| !r.deleted)
+    }
+
+    fn overlay_row_or_tombstone(&self, kind: &str, id: &str) -> Option<RegistryRow> {
         let mut row = self
             .authoritative
             .get(kind)
@@ -669,7 +674,7 @@ impl RegistryDoc {
                 }
             }
         }
-        row.filter(|r| !r.deleted)
+        row
     }
 
     /// All live rows of `kind`, overlay applied.
@@ -762,6 +767,14 @@ impl RegistryDoc {
             fields([("lastSeenAt", json!(at.timestamp_millis()))]),
         );
         Ok(true)
+    }
+
+    /// Whether `id`'s device row was deleted — a tombstone, not merely an
+    /// unknown id (a Cloud session's machine leaves with its sandbox). A
+    /// device that comes back revives its row with a newer write.
+    pub fn device_deleted(&self, id: &str) -> bool {
+        self.overlay_row_or_tombstone(KIND_DEVICES, id)
+            .is_some_and(|r| r.deleted)
     }
 
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
