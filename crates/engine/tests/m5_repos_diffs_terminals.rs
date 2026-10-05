@@ -284,6 +284,32 @@ async fn repository_identity_spans_worktrees_and_clones() {
     assert_eq!(repos.repository_identity(&repo).await.unwrap(), identity);
     assert_eq!(repos.repository_identity(&clone).await.unwrap(), identity);
 
+    // Folders below the top level stay their own projects: monorepo
+    // siblings differ, the same subfolder matches across clones.
+    for dir in [&repo, &clone] {
+        std::fs::create_dir_all(dir.join("apps/web")).unwrap();
+        std::fs::create_dir_all(dir.join("apps/api")).unwrap();
+    }
+    let web = repos
+        .repository_identity(&repo.join("apps/web"))
+        .await
+        .unwrap();
+    assert_eq!(web, format!("{identity}:apps/web"));
+    assert_ne!(
+        repos
+            .repository_identity(&repo.join("apps/api"))
+            .await
+            .unwrap(),
+        web
+    );
+    assert_eq!(
+        repos
+            .repository_identity(&clone.join("apps/web"))
+            .await
+            .unwrap(),
+        web
+    );
+
     // An unrelated repository has its own root.
     let other = temp.path().join("other");
     std::fs::create_dir_all(&other).unwrap();

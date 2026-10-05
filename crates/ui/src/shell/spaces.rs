@@ -5036,8 +5036,10 @@ impl Shell {
                 self.render_project_group_icon(&chat_id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, cx)
             });
             // A real project's group gets a hover-revealed `+` that opens a new
-            // chat homed on it — on the representative checkout; the composer
-            // then picks the device among the repository's checkouts.
+            // chat homed on it — on this device's checkout when it has one
+            // (the project picker's local-first order), never silently on a
+            // possibly offline machine just because it cloned first. The
+            // device chip still switches among the repository's checkouts.
             let group_name = SharedString::from(format!("sidebar-group-hover-{collapse_key}"));
             let group_space = (self.settings.sidebar_organization
                 == SidebarOrganization::ByProject)
@@ -5047,7 +5049,7 @@ impl Shell {
                         .spaces
                         .iter()
                         .find(|space| zeron_proto::view::project_key(space) == key)
-                        .map(|space| state.representative_space(space).id.clone())
+                        .and_then(|space| state.project_members(space).first().map(|m| m.id.clone()))
                 })
                 .flatten();
             let new_chat_button = group_space.map(|project| {

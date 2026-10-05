@@ -219,8 +219,10 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
                 None
             }
         };
+        // `None` = the check failed; the row keeps its last identity below
+        // rather than regrouping the sidebar on a transient git error.
         let repository_id = match inner.repos.repository_identity(path).await {
-            Ok(identity) => Some(identity),
+            Ok(identity) => Some(Some(identity)),
             Err(err) => {
                 tracing::debug!(space = %space_id, error = %err, "spaces: repository identity failed");
                 None
@@ -228,7 +230,7 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
         };
         (checkout_id, repository_id)
     } else {
-        (None, None)
+        (None, Some(None))
     };
     let current = match inner.workspace.read_spaces() {
         Ok(spaces) => spaces.into_iter().find(|s| s.id == space_id),
@@ -240,6 +242,7 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
     let Some(current) = current else {
         return; // deleted while checking
     };
+    let repository_id = repository_id.unwrap_or_else(|| current.repository_id.clone());
     if current.git_detected == detected
         && current.checkout_id == checkout_id
         && current.repository_id == repository_id

@@ -57,6 +57,9 @@ struct Roll {
     started: Instant,
 }
 
+/// Bound on remembered labels (see [`rolling`]).
+const MAX_KEYS: usize = 256;
+
 thread_local! {
     /// Last label per key, plus the roll in flight (if any).
     static ROLLS: RefCell<HashMap<SharedString, (SharedString, Option<Roll>)>> =
@@ -91,6 +94,11 @@ pub fn rolling(
     let now = Instant::now();
     let roll = ROLLS.with(|rolls| {
         let mut rolls = rolls.borrow_mut();
+        // Keys can be per-turn (the working trailer), so bound the map: past
+        // the cap, forget settled labels — they show plain next time.
+        if rolls.len() >= MAX_KEYS && !rolls.contains_key(&key) {
+            rolls.retain(|_, (_, roll)| roll.is_some());
+        }
         let entry = rolls.entry(key).or_insert_with(|| (text.clone(), None));
         if entry.0 != text {
             let from = std::mem::replace(&mut entry.0, text.clone());
@@ -262,7 +270,7 @@ impl Element for RollText {
         shaped: &mut Shaped,
         _prepaint: &mut (),
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
         let elapsed = self.elapsed();
         let duration = DURATION.as_secs_f32();
@@ -453,8 +461,13 @@ impl Element for RollText {
                 }
             }
         });
+        // Keep rolling on the shared ~30Hz pulse clock rather than at the
+        // display's refresh rate: the working timer rolls every second, and
+        // full-rate frames for most of every agent turn were exactly the
+        // battery drain the pulse clock exists to prevent. The lease lapses
+        // on its own once the roll stops painting.
         if Instant::now().saturating_duration_since(self.roll.started) < total() {
-            window.request_animation_frame();
+            crate::motion::pulse_lease(window.current_view(), cx);
         }
     }
 }

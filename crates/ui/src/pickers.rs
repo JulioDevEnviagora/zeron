@@ -648,9 +648,13 @@ pub struct Pickers {
     /// The loaded harness list belongs to the previous device: reload it
     /// once, keeping its rows on screen meanwhile (see the state observer).
     harnesses_stale: bool,
-    /// Loaded model slots from the previous device, each reloaded once
-    /// through the engine's cache while its rows stay on screen.
+    /// Loaded model slots still holding the previous device's catalog: shown
+    /// while the new device's reload runs, never used to resolve a send, and
+    /// cleared only when the new device's answer lands (a failure replaces
+    /// the rows rather than keeping the wrong device's).
     stale_models: HashSet<HarnessId>,
+    /// Stale slots whose reload is in flight (one request per slot).
+    revalidating: HashSet<HarnessId>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -821,6 +825,7 @@ impl Pickers {
                 }
                 this.models.retain(|_, slot| matches!(slot, Loadable::Ready(_)));
                 this.stale_models = this.models.keys().copied().collect();
+                this.revalidating.clear();
                 this.model_refresh_errors.clear();
                 this.catalog_rev += 1;
             }
@@ -905,6 +910,7 @@ impl Pickers {
             model_refresh_errors: HashMap::new(),
             harnesses_stale: false,
             stale_models: HashSet::new(),
+            revalidating: HashSet::new(),
             refs: Loadable::Idle,
             refs_space: None,
             held_ref: None,
@@ -1060,8 +1066,10 @@ impl Pickers {
     /// Effective reasoning — always concrete once the model is known: the
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
-    fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        let explicit = self.config.reasoning.or_else(|| {
+    /// The reasoning level picked, configured or remembered — before any
+    /// clamping to the selected model's ladder.
+    fn explicit_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
+        self.config.reasoning.or_else(|| {
             match self.state.read(cx).selected_chat_row() {
                 Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
                 // New chat: the level last used with this model, else the
@@ -1071,7 +1079,11 @@ impl Pickers {
                     .and_then(|h| self.defaults.reasoning_for(h, self.effective_model_id(cx)))
                     .or(self.defaults.reasoning),
             }
-        });
+        })
+    }
+
+    fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
+        let explicit = self.explicit_reasoning(cx);
         if self.selected_model(cx).is_none() {
             // Catalog not loaded yet: show the explicit value as-is (nothing
             // to clamp against); it resolves to a concrete level on load.
@@ -1192,8 +1204,20 @@ impl Pickers {
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
+        let harness = self.effective_harness(cx);
+        // A catalog still from the previous device must not pick for this
+        // one (its default model, its effort ladder): send only what was
+        // chosen or remembered, as when no catalog has loaded.
+        if harness.is_some_and(|h| self.stale_models.contains(&h)) {
+            return ResolvedRunConfig {
+                harness,
+                model: self.effective_model_id(cx).map(str::to_string),
+                reasoning: self.explicit_reasoning(cx),
+                model_options: self.explicit_options(cx),
+            };
+        }
         ResolvedRunConfig {
-            harness: self.effective_harness(cx),
+            harness,
             model: self
                 .selected_model(cx)
                 .map(|m| m.id.clone())
@@ -1506,7 +1530,9 @@ impl Pickers {
             None | Some(Loadable::Idle) => true,
             Some(Loadable::Loading) => false,
             Some(Loadable::Ready(_)) | Some(Loadable::Error(_)) => {
-                force || self.stale_models.contains(&harness)
+                force
+                    || (self.stale_models.contains(&harness)
+                        && !self.revalidating.contains(&harness))
             }
         };
         if !reload {
@@ -1515,7 +1541,9 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.stale_models.remove(&harness);
+        if self.stale_models.contains(&harness) {
+            self.revalidating.insert(harness);
+        }
         let target = self.space_target(cx);
         let generation = self.target_generation;
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
@@ -1575,11 +1603,27 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                pickers.apply_model_catalog(harness, loaded, cx);
+                pickers.land_model_reload(harness, loaded, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// A model load for the current device landed. A slot that still held
+    /// the previous device's rows is current again either way — on failure
+    /// the error replaces those rows instead of being retained under them.
+    fn land_model_reload(
+        &mut self,
+        harness: HarnessId,
+        loaded: Loadable<Vec<Model>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.revalidating.remove(&harness);
+        if self.stale_models.remove(&harness) && matches!(loaded, Loadable::Error(_)) {
+            self.models.remove(&harness);
+        }
+        self.apply_model_catalog(harness, loaded, cx);
     }
 
     fn apply_model_catalog(
@@ -7197,6 +7241,50 @@ mod tests {
             assert!(pickers.harnesses_stale);
             assert_eq!(pickers.stale_models, HashSet::from([HarnessId::Codex]));
             assert!(!pickers.models.contains_key(&HarnessId::ClaudeCode));
+            // The old device's catalog never picks for the new one: with no
+            // explicit or remembered model, a send leaves the choice to the
+            // new device instead of carrying the old catalog's default.
+            assert_eq!(pickers.resolved(cx).model, None);
+            // A failed reload replaces the old device's rows — it is not
+            // retained like a same-device refresh failure.
+            pickers.land_model_reload(
+                HarnessId::Codex,
+                Loadable::Error("device offline".into()),
+                cx,
+            );
+            assert!(pickers.stale_models.is_empty());
+            assert!(matches!(
+                pickers.models.get(&HarnessId::Codex),
+                Some(Loadable::Error(_))
+            ));
+            assert_ne!(pickers.model_name(cx), ModelName::Named("GPT".into()));
+        });
+    }
+
+    #[gpui::test]
+    fn same_device_refresh_failure_keeps_the_loaded_rows(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults = ComposerDefaults::default();
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(vec![bare_model("gpt", "GPT")]),
+                cx,
+            );
+            pickers.land_model_reload(HarnessId::Codex, Loadable::Error("flaky".into()), cx);
+            assert_eq!(pickers.model_name(cx), ModelName::Named("GPT".into()));
+            assert!(matches!(
+                pickers.models.get(&HarnessId::Codex),
+                Some(Loadable::Ready(_))
+            ));
         });
     }
 
