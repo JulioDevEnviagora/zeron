@@ -339,11 +339,20 @@ impl Repos {
     }
 
     /// Identity shared by every clone and worktree of one repository: the
-    /// normalized `origin` remote (else the first remote) as `host/owner/repo`.
-    /// A repository without a parseable remote falls back to
-    /// `local:sha256(deviceId ‖ NUL ‖ canonical common git dir)`, so its
-    /// worktrees on this device still match each other.
+    /// root commit its trunk grew from, `commit:<sha>`. Unlike a remote URL it
+    /// survives repository renames and transfers, SSH host aliases and
+    /// transport spellings, and it needs no network. Forks share it with
+    /// their upstream (the same codebase).
+    ///
+    /// A history that cannot vouch for its root — a shallow clone, or no
+    /// commits yet — falls back to the normalized `origin` remote (else the
+    /// first remote) as `host/owner/repo`, then to
+    /// `local:sha256(deviceId ‖ NUL ‖ canonical common git dir)`, so the
+    /// repository's worktrees on this device still match each other.
     pub async fn repository_identity(&self, path: &Path) -> Result<String, EngineError> {
+        if let Some(root) = self.trunk_root_commit(path).await {
+            return Ok(format!("commit:{root}"));
+        }
         let remote = match self.git(&["remote", "get-url", "origin"], Some(path)).await {
             Ok(url) => Some(url),
             Err(_) => match self.git(&["remote"], Some(path)).await {
@@ -379,6 +388,33 @@ impl Repos {
         hasher.update([0u8]);
         hasher.update(canonical.to_string_lossy().as_bytes());
         Ok(format!("local:{}", hex(&hasher.finalize())))
+    }
+
+    /// The root of HEAD's first-parent chain — the trunk's first commit. A
+    /// merged-in unrelated history arrives as a second parent, so its roots
+    /// never displace this one. `None` for a shallow clone (its boundary
+    /// commits only look parentless, and differ with the fetch depth) or an
+    /// unborn HEAD.
+    async fn trunk_root_commit(&self, path: &Path) -> Option<String> {
+        let shallow = self
+            .git(&["rev-parse", "--is-shallow-repository"], Some(path))
+            .await
+            .ok()?;
+        if shallow != "false" {
+            return None;
+        }
+        let roots = self
+            .git(
+                &["rev-list", "--first-parent", "--max-parents=0", "HEAD"],
+                Some(path),
+            )
+            .await
+            .ok()?;
+        roots
+            .lines()
+            .map(str::trim)
+            .find(|sha| !sha.is_empty())
+            .map(str::to_owned)
     }
 
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {

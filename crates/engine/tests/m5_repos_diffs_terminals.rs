@@ -258,37 +258,96 @@ async fn repository_identity_spans_worktrees_and_clones() {
     )
     .await;
 
-    // Remote-less: a repository's worktrees share a device-scoped identity.
-    let local = repos.repository_identity(&repo).await.expect("identity");
-    assert!(local.starts_with("local:"), "{local}");
-    assert_eq!(repos.repository_identity(&linked).await.unwrap(), local);
-    let clone = temp.path().join("clone");
-    init_repo(&clone).await;
-    assert_ne!(repos.repository_identity(&clone).await.unwrap(), local);
-
-    // A remote makes it portable: origin wins, else the first remote, and
-    // transport, case and `.git` don't matter.
+    // The trunk's root commit: shared by worktrees, and by clones whatever
+    // their remotes say — an old name kept alive by a rename redirect, an
+    // SSH host alias, another transport.
+    let root = git_stdout(&repo, &["rev-list", "--max-parents=0", "HEAD"]).await;
+    let identity = repos.repository_identity(&repo).await.expect("identity");
+    assert_eq!(identity, format!("commit:{root}"));
+    assert_eq!(repos.repository_identity(&linked).await.unwrap(), identity);
     git(
         &repo,
-        &["remote", "add", "origin", "git@github.com:Anara/Comet.git"],
+        &["remote", "add", "origin", "git@github-alias:zeronsh/old-name.git"],
+    )
+    .await;
+    let clone = temp.path().join("clone");
+    git(
+        temp.path(),
+        &["clone", "-q", repo.to_str().unwrap(), clone.to_str().unwrap()],
     )
     .await;
     git(
         &clone,
+        &["remote", "set-url", "origin", "https://github.com/zeronsh/new-name"],
+    )
+    .await;
+    assert_eq!(repos.repository_identity(&repo).await.unwrap(), identity);
+    assert_eq!(repos.repository_identity(&clone).await.unwrap(), identity);
+
+    // An unrelated repository has its own root.
+    let other = temp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]).await;
+    std::fs::write(other.join("b.txt"), "unrelated\n").unwrap();
+    git(&other, &["add", "."]).await;
+    git(&other, &["commit", "-q", "-m", "other initial"]).await;
+    assert_ne!(repos.repository_identity(&other).await.unwrap(), identity);
+
+    // Merging an unrelated history in adds a root on a second parent; the
+    // trunk's root still names the repository.
+    git(&repo, &["fetch", "-q", other.to_str().unwrap(), "main"]).await;
+    git(
+        &repo,
         &[
-            "remote",
-            "add",
-            "upstream",
-            "https://github.com/anara/comet",
+            "merge",
+            "-q",
+            "--allow-unrelated-histories",
+            "-m",
+            "merge other",
+            "FETCH_HEAD",
         ],
     )
     .await;
+    assert_eq!(repos.repository_identity(&repo).await.unwrap(), identity);
+
+    // A shallow clone can't vouch for its root: the remote names it.
+    let shallow = temp.path().join("shallow");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", repo.display()),
+            shallow.to_str().unwrap(),
+        ],
+    )
+    .await;
+    git(
+        &shallow,
+        &["remote", "set-url", "origin", "https://GitHub.com/ZeronSH/Zeron.git"],
+    )
+    .await;
     assert_eq!(
-        repos.repository_identity(&linked).await.unwrap(),
-        "github.com/anara/comet"
+        repos.repository_identity(&shallow).await.unwrap(),
+        "github.com/zeronsh/zeron"
     );
+
+    // No commits yet: the remote (origin, else the first), then a
+    // device-scoped local identity.
+    let empty = temp.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    git(&empty, &["init", "-q", "-b", "main"]).await;
+    let local = repos.repository_identity(&empty).await.unwrap();
+    assert!(local.starts_with("local:"), "{local}");
+    git(
+        &empty,
+        &["remote", "add", "upstream", "git@github.com:Anara/Comet.git"],
+    )
+    .await;
     assert_eq!(
-        repos.repository_identity(&clone).await.unwrap(),
+        repos.repository_identity(&empty).await.unwrap(),
         "github.com/anara/comet"
     );
 }

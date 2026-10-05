@@ -129,9 +129,11 @@ pub struct Space {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
     /// Owner-stamped when git: identity shared by every clone and worktree of
-    /// one repository — the normalized origin remote (`host/owner/repo`), else
-    /// `local:` + a device-scoped hash of the common git dir. Projects with
-    /// equal ids group together in the sidebar.
+    /// one repository — its trunk's root commit (`commit:<sha>`, which
+    /// survives renames, transfers and remote spellings), else for a shallow
+    /// or empty history the normalized origin remote (`host/owner/repo`),
+    /// else `local:` + a device-scoped hash of the common git dir. Opaque to
+    /// readers: projects with equal ids group together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_id: Option<String>,
     pub created_at: DateTime<Utc>,
