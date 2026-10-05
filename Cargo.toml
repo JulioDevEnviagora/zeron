@@ -173,3 +173,10 @@ inherits = "release"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Trying out the glyph transform/blur branch of zui locally (roll_text's
+# Scritto accents). Drop this section and bump the zui rev once it ships.
+[patch."https://github.com/zeronsh/zui"]
+gpui = { path = "../zui-edgefade/crates/gpui" }
+gpui_platform = { path = "../zui-edgefade/crates/gpui_platform" }
+gpui_tokio = { path = "../zui-edgefade/crates/gpui_tokio" }

@@ -4,10 +4,10 @@
 //! When a keyed label changes, the characters it shares with the old value at
 //! either end stay put (the trailing run slides to its new place), while the
 //! changed middle rolls: old glyphs rise out and shrink away as new ones rise
-//! in from below, staggered left to right, and the label's width glides
-//! between the two. gpui has no glyph blur or rotation, so those two accents
-//! of the original are omitted, and the glyphs ease out without Scritto's
-//! spring overshoot so the label lands dead still (user request).
+//! in from below — each softened by Scritto's 0.1em blur and 2° tilt while
+//! in motion — staggered left to right, and the label's width glides between
+//! the two. The glyphs ease out without Scritto's spring overshoot so the
+//! label lands dead still (user request).
 //!
 //! Steady state renders the ordinary truncating label, so layout, ellipsis and
 //! hit-testing are unchanged whenever nothing is moving; the custom element
@@ -21,18 +21,21 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, ParentElement as _, Pixels, ShapedLine, SharedString, Style,
-    Styled as _, TextRun, Window, div, point, px,
+    IntoElement, LayoutId, ParentElement as _, Pixels, Radians, ScaledPixels, ShapedLine,
+    SharedString, Style, Styled as _, TextRun, TransformationMatrix, Window, div, point, px,
 };
 
 use crate::motion::{CubicBezier, EASE_OUT_QUINT, RESIZE, lerp, speed_scale};
 
 /// Scritto's default roll duration.
 const DURATION: Duration = Duration::from_millis(550);
-/// Per-glyph travel (em), resting scale, and the stagger spread (fraction of
-/// the duration) — Scritto's `{y: .35, scale: .6, stagger: .3}`.
+/// Per-glyph travel (em), resting scale, tilt (degrees), blur (em) and the
+/// stagger spread (fraction of the duration) — Scritto's
+/// `{y: .35, scale: .6, rotate: 2, blur: .1, stagger: .3}`.
 const TRAVEL_EM: f32 = 0.35;
 const REST_SCALE: f32 = 0.6;
+const TILT_DEG: f32 = 2.0;
+const BLUR_EM: f32 = 0.1;
 const STAGGER: f32 = 0.3;
 /// The glyph roll: Scritto's `cubic-bezier(.22,1,.36,1)`, a long settle with
 /// no overshoot.
@@ -45,10 +48,7 @@ const GLIDE: CubicBezier = EASE_OUT_QUINT;
 fn layout_progress(elapsed: f32) -> f32 {
     RESIZE.progress(elapsed / RESIZE.total().as_secs_f32())
 }
-/// Scaled glyphs paint at font sizes quantized to this fraction of a pixel,
-/// so a roll rasterizes a bounded set of sizes per glyph while the last
-/// steps into full size stay too small to see.
-const SIZE_STEP_PX: f32 = 0.125;
+
 
 #[derive(Clone)]
 struct Roll {
@@ -341,40 +341,81 @@ impl Element for RollText {
         let padding_top = (shaped.line_height - shaped.to.ascent - shaped.to.descent) / 2.0;
         let baseline = bounds.origin.y + padding_top + shaped.to.ascent;
         let center_y = f32::from(bounds.origin.y + shaped.line_height / 2.0);
-        // Vertical room for glyphs rolling past the line box; the width clips.
+        let scale_factor = window.scale_factor();
+        // Vertical room for glyphs rolling past the line box, and a small
+        // horizontal allowance for the blur halo; the width otherwise clips.
         let room = px(travel * 2.0);
+        let halo = px((f32::from(font_size) * BLUR_EM * 3.0).ceil());
         let mask = Bounds {
-            origin: point(bounds.origin.x, bounds.origin.y - room),
-            size: gpui::size(bounds.size.width, bounds.size.height + room * 2.0),
+            origin: point(bounds.origin.x - halo, bounds.origin.y - room),
+            size: gpui::size(bounds.size.width + halo * 2.0, bounds.size.height + room * 2.0),
         };
-        let paint = |window: &mut Window, glyph: &Glyph, dx: f32, dy: f32, scale: f32, alpha: f32| {
+        // `motion` = 1 − progress: Scritto's resting-state distance. Tilt and
+        // blur fade with it; scale and translate are the caller's.
+        let paint = |window: &mut Window,
+                     glyph: &Glyph,
+                     dx: f32,
+                     dy: f32,
+                     scale: f32,
+                     motion: f32,
+                     alpha: f32| {
             if alpha <= 0.0 {
                 return;
             }
-            // Scale about the glyph's center, like Scritto's `transform-origin`.
-            // Position follows the quantized size so the two never disagree.
-            let size = (f32::from(font_size) * scale / SIZE_STEP_PX).round() * SIZE_STEP_PX;
-            let scale = size / f32::from(font_size);
             let left = f32::from(bounds.origin.x) + glyph.x;
             let center_x = left + glyph.advance / 2.0;
-            let x = center_x + (left - center_x) * scale + dx;
-            let y = center_y + (f32::from(baseline) + glyph.y - center_y) * scale + dy;
-            let origin = point(px(x), px(y));
-            let _ = if glyph.emoji {
-                // Emoji have no tint to fade; swap them at the midpoint.
+            let rest_origin = point(px(left), px(f32::from(baseline) + glyph.y));
+            if glyph.emoji {
+                // Emoji can be neither tinted nor transformed; they swap at
+                // the midpoint and ride the translation alone.
                 if alpha < 0.5 {
                     return;
                 }
-                window.paint_emoji(origin, glyph.font, glyph.id, font_size * scale)
-            } else {
-                window.paint_glyph(
+                let origin = point(px(left + dx), px(f32::from(baseline) + glyph.y + dy));
+                let _ = window.paint_emoji(origin, glyph.font, glyph.id, font_size);
+                return;
+            }
+            if motion <= 0.0 && dx == 0.0 && dy == 0.0 {
+                // At rest (the shared runs): the ordinary pipeline, so these
+                // glyphs antialias exactly like the label they hand off to.
+                let _ = window.paint_glyph(
+                    rest_origin,
+                    glyph.font,
+                    glyph.id,
+                    font_size,
+                    color.opacity(alpha.min(1.0)),
+                );
+                return;
+            }
+            if scale >= 1.0 && motion <= 0.0 {
+                // The sliding tail: a pure translation, same pipeline.
+                let origin = point(px(left + dx), px(f32::from(baseline) + glyph.y + dy));
+                let _ = window.paint_glyph(
                     origin,
                     glyph.font,
                     glyph.id,
-                    font_size * scale,
+                    font_size,
                     color.opacity(alpha.min(1.0)),
-                )
-            };
+                );
+                return;
+            }
+            // Mid-roll: one full-size raster, scaled and tilted about the
+            // glyph's center at composite time, softened by Scritto's blur.
+            let dev = |value: f32| ScaledPixels(value * scale_factor);
+            let transformation = TransformationMatrix::unit()
+                .translate(point(dev(center_x + dx), dev(center_y + dy)))
+                .rotate(Radians((TILT_DEG * motion).to_radians()))
+                .scale(gpui::size(scale, scale))
+                .translate(point(dev(-center_x), dev(-center_y)));
+            let _ = window.paint_glyph_transformed(
+                rest_origin,
+                glyph.font,
+                glyph.id,
+                font_size,
+                color.opacity(alpha.min(1.0)),
+                transformation,
+                px(f32::from(font_size) * BLUR_EM * motion),
+            );
         };
         window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
             for glyph in &from_glyphs {
@@ -388,14 +429,15 @@ impl Element for RollText {
                     0.0,
                     -travel * progress,
                     lerp(1.0, REST_SCALE, progress),
+                    progress,
                     1.0 - progress,
                 );
             }
             for glyph in &to_glyphs {
                 if glyph.index < prefix {
-                    paint(window, glyph, 0.0, 0.0, 1.0, 1.0);
+                    paint(window, glyph, 0.0, 0.0, 1.0, 0.0, 1.0);
                 } else if glyph.index >= to_len - suffix {
-                    paint(window, glyph, suffix_dx, 0.0, 1.0, 1.0);
+                    paint(window, glyph, suffix_dx, 0.0, 1.0, 0.0, 1.0);
                 } else {
                     let progress =
                         GLIDE.eval(((elapsed - to_delay(glyph.x)) / duration).clamp(0.0, 1.0));
@@ -405,6 +447,7 @@ impl Element for RollText {
                         0.0,
                         travel * (1.0 - progress),
                         lerp(REST_SCALE, 1.0, progress),
+                        1.0 - progress,
                         progress,
                     );
                 }
