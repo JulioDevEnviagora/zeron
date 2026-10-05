@@ -1196,8 +1196,10 @@ impl Pickers {
     /// enabled). False while the catalog is still loading or failed
     /// (nothing to conclude yet; offline sends must not be blocked on it).
     pub fn no_agents_available(&self) -> bool {
+        // The previous device's list can't speak for this one.
         self.harnesses
             .ready()
+            .filter(|_| !self.harnesses_stale)
             .is_some_and(|list| self.offered(list).is_empty())
     }
 
