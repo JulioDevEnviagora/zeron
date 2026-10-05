@@ -6554,7 +6554,14 @@ impl Transcript {
                             theme.text_muted
                         })
                         .child(crate::roll_text::roll_text(
-                            format!("working-word-{}-{turn}", cx.entity_id()),
+                            // While sending, the session row still carries the
+                            // PREVIOUS turn: key the bridge on its own so it
+                            // never rolls out of that turn's last word.
+                            if sending {
+                                format!("working-word-{}-sending", cx.entity_id())
+                            } else {
+                                format!("working-word-{}-{turn}", cx.entity_id())
+                            },
                             SharedString::from(if queued {
                                 word.to_string()
                             } else {

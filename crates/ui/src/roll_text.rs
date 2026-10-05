@@ -108,10 +108,13 @@ pub fn rolling(
                 started: now,
             });
         }
-        if entry
-            .1
-            .as_ref()
-            .is_some_and(|roll| now.saturating_duration_since(roll.started) >= total())
+        // Finished — or reduced motion switched on mid-roll, where no frames
+        // would come to finish it: settle on the plain label now.
+        if reduced
+            || entry
+                .1
+                .as_ref()
+                .is_some_and(|roll| now.saturating_duration_since(roll.started) >= total())
         {
             entry.1 = None;
         }

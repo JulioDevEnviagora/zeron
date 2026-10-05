@@ -648,6 +648,8 @@ pub struct Pickers {
     /// The loaded harness list belongs to the previous device: reload it
     /// once, keeping its rows on screen meanwhile (see the state observer).
     harnesses_stale: bool,
+    /// The stale harness list's reload is in flight (one request).
+    harnesses_revalidating: bool,
     /// Loaded model slots still holding the previous device's catalog: shown
     /// while the new device's reload runs, never used to resolve a send, and
     /// cleared only when the new device's answer lands (a failure replaces
@@ -818,6 +820,7 @@ impl Pickers {
             if device_changed {
                 this.target_generation = this.target_generation.wrapping_add(1);
                 this.load_task = None;
+                this.harnesses_revalidating = false;
                 if matches!(this.harnesses, Loadable::Ready(_)) {
                     this.harnesses_stale = true;
                 } else {
@@ -909,6 +912,7 @@ impl Pickers {
             models: HashMap::new(),
             model_refresh_errors: HashMap::new(),
             harnesses_stale: false,
+            harnesses_revalidating: false,
             stale_models: HashSet::new(),
             revalidating: HashSet::new(),
             refs: Loadable::Idle,
@@ -1026,8 +1030,12 @@ impl Pickers {
         // New-chat canvas: the remembered last-used harness (sticky defaults),
         // when the loaded catalog still offers it (the device may have
         // disabled it in Settings → Providers since).
+        // A list still from the previous device reads as not loaded: it may
+        // offer harnesses this device lacks, and what the chip shows must be
+        // what a send would carry.
+        let fresh = self.harnesses.ready().filter(|_| !self.harnesses_stale);
         if let Some(harness) = self.defaults.harness {
-            let offered = match self.harnesses.ready() {
+            let offered = match fresh {
                 Some(list) => offered_harnesses(list).iter().any(|d| d.id == harness),
                 None => true, // catalog not loaded yet — trust the memory
             };
@@ -1039,9 +1047,7 @@ impl Pickers {
         // harness first, and resolving chips against it would boot the
         // new-chat canvas onto "Mock" instead of Claude Code + its default
         // model (it stays available under `ZERON_HARNESS=mock`).
-        self.harnesses
-            .ready()
-            .and_then(|list| offered_harnesses(list).first().map(|d| d.id))
+        fresh.and_then(|list| offered_harnesses(list).first().map(|d| d.id))
     }
 
     /// Effective model id: the draft pick, the selected chat's config, or (on
@@ -1084,7 +1090,12 @@ impl Pickers {
 
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
         let explicit = self.explicit_reasoning(cx);
-        if self.selected_model(cx).is_none() {
+        // The old device's ladder must not clamp the chip's level either:
+        // a send in this window carries the unclamped value.
+        let stale = self
+            .effective_harness(cx)
+            .is_some_and(|h| self.stale_models.contains(&h));
+        if stale || self.selected_model(cx).is_none() {
             // Catalog not loaded yet: show the explicit value as-is (nothing
             // to clamp against); it resolves to a concrete level on load.
             return explicit;
@@ -1451,7 +1462,9 @@ impl Pickers {
         let reload = match self.harnesses {
             Loadable::Idle => true,
             Loadable::Loading => false,
-            Loadable::Ready(_) | Loadable::Error(_) => force || self.harnesses_stale,
+            Loadable::Ready(_) | Loadable::Error(_) => {
+                force || (self.harnesses_stale && !self.harnesses_revalidating)
+            }
         };
         if !reload {
             return;
@@ -1459,7 +1472,9 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.harnesses_stale = false;
+        if self.harnesses_stale {
+            self.harnesses_revalidating = true;
+        }
         let target = self.space_target(cx);
         let generation = self.target_generation;
         if !matches!(self.harnesses, Loadable::Ready(_)) {
@@ -1485,6 +1500,8 @@ impl Pickers {
                 if pickers.target_generation != generation {
                     return;
                 }
+                pickers.harnesses_stale = false;
+                pickers.harnesses_revalidating = false;
                 pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
@@ -7224,6 +7241,8 @@ mod tests {
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         pickers.update(cx, |pickers, cx| {
             pickers.defaults = ComposerDefaults::default();
+            // Real use always has a picked or remembered harness.
+            pickers.config.harness = Some(HarnessId::Codex);
             pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
             pickers.apply_model_catalog(
                 HarnessId::Codex,
@@ -7258,6 +7277,12 @@ mod tests {
                 Some(Loadable::Error(_))
             ));
             assert_ne!(pickers.model_name(cx), ModelName::Named("GPT".into()));
+            // With nothing picked or remembered, the old device's harness list
+            // doesn't choose either — for the chip or a send.
+            pickers.config.harness = None;
+            assert!(pickers.harnesses_stale);
+            assert_eq!(pickers.effective_harness(cx), None);
+            assert_eq!(pickers.resolved(cx).harness, None);
         });
     }
 
