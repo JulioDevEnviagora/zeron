@@ -615,9 +615,10 @@ pub struct Pickers {
     chip_resizing: bool,
     open_model_height: f32,
     compact_model_list: bool,
-    /// The compact picker's provider page, entered from the panel's
-    /// provider button; exclusive with [`Self::compact_model_list`].
-    compact_providers: bool,
+    /// The model list's provider tab strip: its sideways scroll, and the
+    /// tab last brought into view as the list scrolled.
+    compact_strip_scroll: gpui::ScrollHandle,
+    compact_strip_viewed: Option<usize>,
     effort_dragging: bool,
     compact_motion: compact::CompactMotion,
     compact_keyboard: bool,
@@ -874,7 +875,8 @@ impl Pickers {
             chip_resizing: false,
             open_model_height: model_menu_height(0),
             compact_model_list: false,
-            compact_providers: false,
+            compact_strip_scroll: gpui::ScrollHandle::new(),
+            compact_strip_viewed: None,
             effort_dragging: false,
             compact_motion: compact::CompactMotion::default(),
             compact_keyboard: false,
@@ -1290,7 +1292,7 @@ impl Pickers {
         if kind == PickerKind::HarnessModel {
             self.open_model_height = model_menu_height(self.setting_groups(cx).len());
             self.compact_model_list = false;
-            self.compact_providers = false;
+            self.compact_strip_viewed = None;
             self.effort_dragging = false;
             self.compact_keyboard = false;
             self.compact_motion = compact::CompactMotion::default();
@@ -2168,8 +2170,6 @@ impl Pickers {
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
         if self.setting_menu.is_some() {
             self.activate_setting_choice(cx);
-        } else if self.compact_model_picker(cx) && self.compact_providers {
-            self.activate_compact_provider(cx);
         } else if self.compact_model_picker(cx) && self.compact_model_list {
             self.activate_model_index(self.active, cx);
         } else if let Some(index) = self.active.checked_sub(self.model_rows_len(cx)) {
@@ -2888,10 +2888,6 @@ impl Pickers {
             return;
         }
         if self.open_kind() == Some(PickerKind::HarnessModel) && self.compact_model_picker(cx) {
-            if self.compact_providers {
-                self.compact_provider_key(event, cx);
-                return;
-            }
             if !self.compact_model_list {
                 self.compact_panel_key(event, cx);
                 return;
@@ -4229,7 +4225,7 @@ impl Pickers {
         }
 
         if compact {
-            tabs = self.compact_list_header(cx);
+            tabs = self.compact_model_back_header(cx);
         }
 
         // ── search row: icon + borderless input over a full-bleed hairline.
@@ -4395,8 +4391,7 @@ impl Pickers {
             .flex()
             .flex_col()
             .child(tabs)
-            // The compact header carries the filter beside its back button.
-            .when(!compact, |el| el.child(search_row))
+            .child(search_row)
             .children(refresh_error)
             .child(list_host)
             .children(tray)
@@ -8410,7 +8405,7 @@ mod tests {
         cx.simulate_keystrokes(handle.into(), "tab");
         handle
             .read_with(cx, |picker, cx| {
-                assert!(!picker.compact_model_list && !picker.compact_providers);
+                assert!(!picker.compact_model_list);
                 assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
             })
             .unwrap();
@@ -8738,23 +8733,24 @@ mod tests {
                 picker.pick_compact_provider(HarnessId::ClaudeCode, cx);
                 assert_eq!(picker.resolved(cx).model.as_deref(), Some("opus"));
                 assert_eq!(picker.effective_reasoning(cx), Some(ReasoningLevel::High));
-                // Starring adds a Starred entry ahead of the providers; it
-                // opens the starred models from every provider.
-                assert!(matches!(
-                    picker.compact_provider_rows(cx).first(),
-                    Some(compact::ProviderRow::Harness(_))
-                ));
+                // The list's tabs are its provider groups, in list order;
+                // starring adds a Starred tab ahead of them, holding the
+                // starred models from every provider.
+                picker.show_compact_models(cx);
+                assert_eq!(
+                    picker.compact_groups(cx),
+                    vec![(Some(HarnessId::Codex), 0), (Some(HarnessId::ClaudeCode), 2)]
+                );
                 picker.toggle_model_favorite(HarnessId::Codex, "gpt-a", cx);
-                picker.show_compact_providers(cx);
-                assert!(matches!(
-                    picker.compact_provider_rows(cx).first(),
-                    Some(compact::ProviderRow::Starred)
-                ));
-                picker.active = 0;
-                picker.activate_compact_provider(cx);
-                assert!(picker.compact_model_list && !picker.compact_providers);
+                assert_eq!(
+                    picker.compact_groups(cx),
+                    vec![
+                        (None, 0),
+                        (Some(HarnessId::Codex), 1),
+                        (Some(HarnessId::ClaudeCode), 2),
+                    ]
+                );
                 let rows = picker.model_rows(cx);
-                assert_eq!(rows.len(), 1);
                 assert_eq!(
                     (rows[0].harness, rows[0].model.id.as_str()),
                     (HarnessId::Codex, "gpt-a")
@@ -8817,14 +8813,10 @@ mod tests {
                 picker.activate_model_index(1, cx);
                 assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
                 picker.pick_harness(HarnessId::Codex, cx);
-                // The provider page lists every provider, highlighting the
-                // current one, and a pick lands back on the panel.
-                picker.show_compact_providers(cx);
-                assert!(picker.compact_providers && !picker.compact_model_list);
-                assert_eq!(picker.compact_provider_rows(cx).len(), 2);
-                assert_eq!(picker.active, 0);
+                // Switching provider (Tab on the panel) lands back on the
+                // panel at that provider's model.
                 picker.pick_compact_provider(HarnessId::ClaudeCode, cx);
-                assert!(!picker.compact_providers && !picker.compact_model_list);
+                assert!(!picker.compact_model_list);
                 assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
                 assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude-model"));
                 picker.pick_harness(HarnessId::Codex, cx);
@@ -8841,10 +8833,12 @@ mod tests {
                 picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
                 assert_eq!(picker.model_rows_len(cx), 0);
                 picker.search.update(cx, |input, cx| input.set_text("", cx));
-                // A chat's provider is fixed: the provider page stays shut.
+                // A chat's provider is fixed: one tab, its own.
+                assert_eq!(
+                    picker.compact_groups(cx),
+                    vec![(Some(HarnessId::Codex), 0)]
+                );
                 picker.compact_model_list = false;
-                picker.show_compact_providers(cx);
-                assert!(!picker.compact_providers);
                 picker.focus_on_mount = true;
             })
             .unwrap();
