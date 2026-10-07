@@ -257,6 +257,11 @@ impl Harness for CursorHarness {
     fn stops_turn_in_place(&self) -> bool {
         true
     }
+    /// Each SDK send names its model, so a change runs from the next turn on
+    /// the same agent; no model is Cursor's `auto`.
+    fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        live.cwd == next.cwd
+    }
 
     /// Keep a successful catalog during transient outages. A cold failure
     /// is an error, never a fabricated two-model success.
@@ -682,7 +687,14 @@ async fn run_session(session: Session) {
                     pending_steers += 1;
                     parked = false;
                     any_done = false;
-                    let _ = stdin_tx.send(json!({ "op": "steer", "prompt": msg.prompt }).to_string());
+                    let mut line = json!({ "op": "steer", "prompt": msg.prompt });
+                    // A changed model runs from this message's own turn.
+                    if let Some(next) = msg.config {
+                        line["reconfigure"] = Value::Bool(true);
+                        line["model"] = json!(next.model);
+                        line["modelOptions"] = Value::Object(next.model_options);
+                    }
+                    let _ = stdin_tx.send(line.to_string());
                 }
                 None => {
                     steering_open = false;

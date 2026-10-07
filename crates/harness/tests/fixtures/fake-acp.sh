@@ -200,6 +200,40 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:reconfigure*)
+  # Model switches: one sent between turns, one sent mid-turn. Each set must
+  # reach the session before the prompt it was sent with.
+  next_turn() { # reads 0..n sets then the prompt; leaves them in SETS / pid
+    SETS=""
+    read -r promptline || exit 1
+    while has "$promptline" '"method":"session/set_config_option"'; do
+      emit "{\"id\":$(rid "$promptline"),\"result\":{}}"
+      SETS="$SETS $promptline"
+      read -r promptline || exit 1
+    done
+    has "$promptline" '"method":"session/prompt"' || exit 1
+    pid=$(rid "$promptline")
+  }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"turn1"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  next_turn
+  if has "$SETS" '"value":"grok-4-fast"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"on fast"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"switch missing"}}'
+  fi
+  sleep 0.5
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  next_turn
+  if has "$SETS" '"value":"grok-4.5"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"back on 4.5"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"switch missing"}}'
+  fi
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
+  ;;
+
 *scenario:happy*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}'
   update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'

@@ -377,6 +377,14 @@ impl Harness for OpencodeHarness {
     fn stops_turn_in_place(&self) -> bool {
         true
     }
+    /// The model and effort ride each prompt (1.x) or are set on the
+    /// session (2.x), so a change applies from the next prompt without a new
+    /// server. Clearing one back to the default cannot be expressed that way.
+    fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        live.cwd == next.cwd
+            && (next.model.is_some() || live.model.is_none())
+            && (next.reasoning.is_some() || live.reasoning.is_none())
+    }
 
     /// Live discovery off `GET /provider` (what the desktop app populates its
     /// picker from). Account/config changes invalidate the last-good catalog;
@@ -1588,14 +1596,7 @@ async fn run_session(session: Session) {
         }
     };
 
-    let model = request
-        .model
-        .as_deref()
-        .and_then(|m| m.split_once('/'))
-        .map(|(provider, model)| (provider.to_owned(), model.to_owned()));
-    let variant = model.as_ref().and_then(|(provider, model_id)| {
-        pick_variant(&providers, provider, model_id, request.reasoning)
-    });
+    let (mut model, mut variant) = model_selection(&providers, &request);
     let context_windows: HashMap<String, u64> = providers
         .all
         .iter()
@@ -1735,9 +1736,7 @@ async fn run_session(session: Session) {
     let mut pending_spawns: VecDeque<PendingSpawn> = VecDeque::new();
     // Child sessions created before their spawn chip was seen (id → title).
     let mut unbound_children: HashMap<String, String> = HashMap::new();
-    // Steers waiting for the turn's end: text, whether it selects a native
-    // command, and the images it carries.
-    let mut queued_steers: VecDeque<(String, bool, Vec<String>)> = VecDeque::new();
+    let mut queued_steers: VecDeque<QueuedSteer> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupt_requested = false;
     // A turn stop (`TurnControl::stop_turn`) in flight: the session is
@@ -1788,18 +1787,24 @@ async fn run_session(session: Session) {
                 abort_deadline = None;
                 continue $label;
             }
-            if let Some((first, native_command_selected, mut attachments)) = queued_steers.pop_front() {
+            if let Some(first) = queued_steers.pop_front() {
                 turn_generation = turn_generation.wrapping_add(1);
+                let native_command_selected = first.native;
+                let config = first.config;
+                let mut attachments = first.attachments;
                 // Plain-text steers waiting together go out as one prompt,
                 // each confirmed by its own Steered boundary; a native
-                // command always travels alone.
-                let mut texts = vec![first];
+                // command always travels alone, and a changed configuration
+                // starts a new prompt (the ones after it were sent with it).
+                let mut texts = vec![first.text];
                 while !native_command_selected
-                    && queued_steers.front().is_some_and(|(_, native, _)| !native)
+                    && queued_steers
+                        .front()
+                        .is_some_and(|next| !next.native && next.config.is_none())
                 {
-                    let (text, _, images) = queued_steers.pop_front().expect("front checked");
-                    texts.push(text);
-                    attachments.extend(images);
+                    let next = queued_steers.pop_front().expect("front checked");
+                    texts.push(next.text);
+                    attachments.extend(next.attachments);
                 }
                 let mut consumer_gone = false;
                 for _ in &texts {
@@ -1816,24 +1821,33 @@ async fn run_session(session: Session) {
                     break $label;
                 }
                 let steer = texts.join("\n\n");
-                match post_prompt(
-                    &server,
-                    &bus_tx,
-                    &session_id,
-                    dir,
-                    &commands,
-                    &steer,
-                    native_command_selected,
-                    turn_generation,
-                    &command_failure_tx,
-                    TurnSpec {
-                        model: model.as_ref(),
-                        variant: variant.as_deref(),
-                        attachments: &attachments,
-                    },
-                )
-                .await
-                {
+                let adopted = match config {
+                    Some(next) => adopt_config(&server, &session_id, dir, &next)
+                        .await
+                        .map(|selection| (model, variant) = selection),
+                    None => Ok(()),
+                };
+                let sent = match adopted {
+                    Ok(()) => post_prompt(
+                        &server,
+                        &bus_tx,
+                        &session_id,
+                        dir,
+                        &commands,
+                        &steer,
+                        native_command_selected,
+                        turn_generation,
+                        &command_failure_tx,
+                        TurnSpec {
+                            model: model.as_ref(),
+                            variant: variant.as_deref(),
+                            attachments: &attachments,
+                        },
+                    )
+                    .await,
+                    Err(e) => Err(e),
+                };
+                match sent {
                     Ok(()) => {
                         turn = TurnState::begin(stall);
                         continue $label;
@@ -2047,11 +2061,12 @@ async fn run_session(session: Session) {
                             HarnessId::Opencode,
                         );
                         if turn.active {
-                            queued_steers.push_back((
-                                prompt,
-                                native_command_selected,
-                                steer.attachments,
-                            ));
+                            queued_steers.push_back(QueuedSteer {
+                                text: prompt,
+                                native: native_command_selected,
+                                attachments: steer.attachments,
+                                config: steer.config,
+                            });
                             maybe_preempt!();
                         } else {
                             turn_generation = turn_generation.wrapping_add(1);
@@ -2062,24 +2077,33 @@ async fn run_session(session: Session) {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),
                             }).await;
-                            match post_prompt(
-                                &server,
-                                &bus_tx,
-                                &session_id,
-                                dir,
-                                &commands,
-                                &prompt,
-                                native_command_selected,
-                                turn_generation,
-                                &command_failure_tx,
-                                TurnSpec {
-                                    model: model.as_ref(),
-                                    variant: variant.as_deref(),
-                                    attachments: &steer.attachments,
-                                },
-                            )
-                            .await
-                            {
+                            let adopted = match &steer.config {
+                                Some(next) => adopt_config(&server, &session_id, dir, next)
+                                    .await
+                                    .map(|selection| (model, variant) = selection),
+                                None => Ok(()),
+                            };
+                            let sent = match adopted {
+                                Ok(()) => post_prompt(
+                                    &server,
+                                    &bus_tx,
+                                    &session_id,
+                                    dir,
+                                    &commands,
+                                    &prompt,
+                                    native_command_selected,
+                                    turn_generation,
+                                    &command_failure_tx,
+                                    TurnSpec {
+                                        model: model.as_ref(),
+                                        variant: variant.as_deref(),
+                                        attachments: &steer.attachments,
+                                    },
+                                )
+                                .await,
+                                Err(e) => Err(e),
+                            };
+                            match sent {
                                 Ok(()) => turn = TurnState::begin(stall),
                                 Err(error) => {
                                     let message = error.to_string();
@@ -2391,6 +2415,53 @@ fn context_usage_event(info: &Value, context_windows: &HashMap<String, u64>) -> 
 }
 
 /// The requested effort as a variant id the model actually advertises.
+/// A message waiting for the turn's end.
+struct QueuedSteer {
+    text: String,
+    /// It selects a native command (which always travels alone).
+    native: bool,
+    attachments: Vec<String>,
+    /// The configuration it was sent with, adopted before its prompt.
+    config: Option<Box<RunRequest>>,
+}
+
+/// The `provider/model` pair and reasoning variant a request runs with.
+fn model_selection(
+    providers: &ProviderCatalog,
+    request: &RunRequest,
+) -> (Option<(String, String)>, Option<String>) {
+    let model = request
+        .model
+        .as_deref()
+        .and_then(|m| m.split_once('/'))
+        .map(|(provider, model)| (provider.to_owned(), model.to_owned()));
+    let variant = model.as_ref().and_then(|(provider, model_id)| {
+        pick_variant(providers, provider, model_id, request.reasoning)
+    });
+    (model, variant)
+}
+
+/// Adopt `next`'s model and effort for the prompts that follow: 1.x carries
+/// them on each prompt, 2.x sets them on the session first. The catalog is
+/// fetched again here rather than held for the session's life.
+async fn adopt_config(
+    server: &Server,
+    session_id: &str,
+    dir: Option<&str>,
+    next: &RunRequest,
+) -> Result<(Option<(String, String)>, Option<String>), HarnessError> {
+    let providers = server.provider_catalog(dir).await.unwrap_or_default();
+    let (model, variant) = model_selection(&providers, next);
+    if server.protocol().await == Protocol::V2
+        && let Some((provider, model_id)) = &model
+    {
+        server
+            .set_model(session_id, provider, model_id, variant.as_deref(), dir)
+            .await?;
+    }
+    Ok((model, variant))
+}
+
 fn pick_variant(
     providers: &ProviderCatalog,
     provider_id: &str,

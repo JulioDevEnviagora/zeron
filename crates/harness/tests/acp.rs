@@ -234,6 +234,64 @@ async fn config_options_apply_requested_model_and_effort() {
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
+/// A model switch reaches the live session: between turns before the
+/// message's prompt, and — sent mid-turn — only once the turn has ended,
+/// still ahead of its own prompt. No new agent either way.
+#[tokio::test]
+async fn a_model_switch_is_selected_on_the_live_session() {
+    let (controls, steer, _token) = controls();
+    let opening = request("scenario:reconfigure");
+    let mut fast = opening.clone();
+    fast.model = Some("grok-4-fast".into());
+    assert!(harness().reconfigures_in_place(&opening, &fast));
+    let mut stream = harness()
+        .run(opening.clone(), controls)
+        .await
+        .expect("run starts");
+    let mut texts = Vec::new();
+    let mut started = 0;
+    let mut dones = 0;
+    while dones < 3 {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        match event {
+            AgentEvent::SessionStarted { .. } => started += 1,
+            AgentEvent::TextDelta { text } => {
+                if text == "on fast" {
+                    // Mid-turn: back to the opening model.
+                    steer
+                        .send(SteerMessage {
+                            config: Some(Box::new(opening.clone())),
+                            ..SteerMessage::text("back")
+                        })
+                        .await
+                        .unwrap();
+                }
+                texts.push(text);
+            }
+            AgentEvent::Done { status, error, .. } => {
+                assert_eq!(status, DoneStatus::Completed, "{error:?}");
+                dones += 1;
+                if dones == 1 {
+                    steer
+                        .send(SteerMessage {
+                            config: Some(Box::new(fast.clone())),
+                            ..SteerMessage::text("go fast")
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started, 1);
+    assert_eq!(texts, ["turn1", "on fast", "back on 4.5"]);
+}
+
 #[tokio::test]
 async fn resumed_first_class_model_is_switched_before_prompt() {
     let (controls, _steer, _token) = controls();

@@ -710,3 +710,86 @@ async fn stop_tears_down_all_agent_work() {
         .args(["-f", "time.sleep.(19[1-5])"])
         .status();
 }
+
+/// Issue #831: the idle reaper ended a parked Claude session whose agent
+/// still ran a background shell, killing it before its completion woke the
+/// agent. With a short idle window, the shell outlives the window, finishes
+/// in the same process, and its completion wakes the agent.
+///
+/// ZERON_TEST_MODEL=claude-haiku-5-5 \
+///   cargo test -p zeron-engine --test runtime_survival_live idle_reaper_ -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "uses real model quota; select an inexpensive model explicitly"]
+async fn idle_reaper_spares_a_background_shell_until_it_wakes_the_agent() {
+    // SAFETY: set before the engine starts; this test binary runs it alone
+    // under the documented filter.
+    unsafe {
+        std::env::set_var("ZERON_SESSION_IDLE_MS", "15000");
+    }
+    let model = std::env::var("ZERON_TEST_MODEL").ok();
+    let id = zeron_proto::HarnessId::ClaudeCode;
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_str().unwrap().to_owned();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ClaudeHarness::new()));
+    let core =
+        EngineCore::assemble(&dir.path().join("engine"), Arc::new(registry), id, None).unwrap();
+    core.workspace
+        .create_space("space", &core.device_id, &cwd, None, false)
+        .unwrap();
+    core.workspace
+        .create_chat(CHAT, Some("space"), None, None, None)
+        .unwrap();
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request: run(
+                    "This is an automated test in a disposable directory. Do exactly one thing, then end your turn at once without waiting for it: \
+                     use the Bash tool with run_in_background=true to run exactly: sleep 45 && printf done > bg-done . \
+                     Reply only STARTED. Later, when you are notified that the command finished, reply only FINISHED.",
+                    &model,
+                    id,
+                    &cwd,
+                ),
+                message_id: "m-1".into(),
+            },
+        )
+        .unwrap();
+    wait(
+        &core,
+        240,
+        || completed_turns(&core) >= 1 && status(&core) == Some(SessionStatus::Idle),
+        "the opening turn",
+    )
+    .await;
+    assert!(
+        core.sessions.holds_background_work(CHAT),
+        "the agent never launched the background shell: {:#?}",
+        journal(&core)
+    );
+    println!("claude: parked with the background shell running");
+    // Three idle windows pass before the shell ends: the reaper must spare it.
+    wait(
+        &core,
+        240,
+        || dir.path().join("bg-done").exists(),
+        "the background shell to finish",
+    )
+    .await;
+    println!("claude: background shell finished");
+    wait(
+        &core,
+        240,
+        || completed_turns(&core) >= 2 && status(&core) == Some(SessionStatus::Idle),
+        "the completion to wake the agent",
+    )
+    .await;
+    assert_eq!(processes(&core), 1, "the reaper restarted the agent");
+    assert!(
+        core.sessions.live_run_steerable(CHAT),
+        "the woken session is still live"
+    );
+    println!("claude: the completion woke the same process");
+    core.shutdown().await;
+}

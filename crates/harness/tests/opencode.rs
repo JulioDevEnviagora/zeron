@@ -825,6 +825,81 @@ async fn images_sent_mid_turn_ride_the_queued_prompt() {
     assert_eq!(images, ["file:///tmp/one.png", "file:///tmp/two.png"]);
 }
 
+/// A model switch reaches the live server: from the next prompt between
+/// turns, and mid-turn from the prompt of the message it was sent with —
+/// never merged into a prompt sent with the previous model.
+#[tokio::test]
+async fn a_model_switch_rides_the_next_prompt() {
+    let fake = FakeOpencode::start().await;
+    let (controls, steer, _token) = controls();
+    let mut opening = request("hi");
+    opening.model = Some("prov/model-a".into());
+    let driver = harness(&fake);
+    let mut switched = request("");
+    switched.model = Some("prov/model-b".into());
+    assert!(driver.reconfigures_in_place(&opening, &switched));
+    let mut stream = driver
+        .run(opening.clone(), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+
+    let send = |text: &str, config: Option<&RunRequest>| SteerMessage {
+        config: config.cloned().map(Box::new),
+        ..SteerMessage::text(text)
+    };
+    steer.send(send("on b", Some(&switched))).await.unwrap();
+    wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
+    assistant_message(&fake, "ses_test", "msg_2");
+    // A running tool holds what follows for the turn's end.
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_tool", "messageID": "msg_2", "sessionID": "ses_test",
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "running", "input": { "command": "sleep 1" } },
+        }},
+    }));
+    steer.send(send("still b", None)).await.unwrap();
+    steer.send(send("back on a", Some(&opening))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_tool", "messageID": "msg_2", "sessionID": "ses_test",
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "completed", "input": { "command": "sleep 1" }, "output": "" },
+        }},
+    }));
+    idle(&fake, "ses_test");
+    wait_posts(&fake, "/session/ses_test/prompt_async", 3).await;
+    assistant_message(&fake, "ses_test", "msg_3");
+    idle(&fake, "ses_test");
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 4).await;
+    let sent: Vec<(String, String)> = prompts
+        .iter()
+        .map(|p| {
+            (
+                p["parts"][0]["text"].as_str().unwrap_or("").to_owned(),
+                p["model"]["modelID"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            ("hi".to_owned(), "model-a".to_owned()),
+            ("on b".to_owned(), "model-b".to_owned()),
+            ("still b".to_owned(), "model-b".to_owned()),
+            ("back on a".to_owned(), "model-a".to_owned()),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn provider_retries_surface_and_cap_out() {
     let fake = FakeOpencode::start().await;

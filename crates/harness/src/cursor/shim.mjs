@@ -13,7 +13,10 @@
 //   stdin  (engine → shim):
 //     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?}   start / first turn
 //     {"op":"user","prompt"}                            explicit next turn
-//     {"op":"steer","prompt"}                           native mid-turn input
+//     {"op":"steer","prompt","model"?,"modelOptions"?,"reconfigure"?}
+//                                                       native mid-turn input;
+//                                                       `reconfigure` = runs as
+//                                                       its own turn on `model`
 //     {"op":"interrupt"}                                cancel the live run
 //     {"op":"stop"}                                     cancel this turn only; the agent stays up
 //   stdout (shim → engine):
@@ -448,6 +451,16 @@ function withAuthHint(message) {
 // Keep ownership until Cursor confirms that the active turn appended the text.
 // A boundary race returns revert_to_followup; only those messages start a turn.
 const pendingSteers = [];
+// The model the agent runs: set at start, replaced by a reconfiguring
+// message. Once replaced, every send names it (a send's model is per-run).
+let currentModel = null;
+let modelChanged = false;
+// Messages up to (not including) the first that changes the model: only
+// those may ride the running turn, natively or batched.
+function steerableNow() {
+  const at = pendingSteers.findIndex(message => message.selection);
+  return at < 0 ? pendingSteers : pendingSteers.slice(0, at);
+}
 const steerDeliveries = new Set();
 let steerPump = null;
 let turnActive = false;
@@ -493,7 +506,7 @@ function pumpSteers() {
       if (typeof target.steer !== "function") {
         throw new Error("Cursor SDK lacks native steering; update the managed SDK");
       }
-      const message = pendingSteers.find(message => !message.submitted && message.revertedRun !== target);
+      const message = steerableNow().find(message => !message.submitted && message.revertedRun !== target);
       if (!message) return;
       const reverted = await recordNativeSteer(message.prompt);
       // History lookup can yield while another tool starts. Never let native
@@ -525,7 +538,14 @@ function pumpSteers() {
 }
 async function followupSteers() {
   while (pendingSteers.length && !interrupted && !closing) {
-    const batch = pendingSteers.splice(0);
+    // A model change starts its own turn: it never joins the messages sent
+    // before it, and those after it run on its model.
+    if (pendingSteers[0].selection) {
+      currentModel = pendingSteers[0].selection;
+      modelChanged = true;
+    }
+    const next = pendingSteers.findIndex((message, i) => i > 0 && message.selection);
+    const batch = pendingSteers.splice(0, next < 0 ? pendingSteers.length : next);
     // A later input can be delivered before an earlier one is rejected.
     // Never replay the delivered input when draining the rejected prefix.
     const undelivered = batch.filter(message => !message.delivered);
@@ -538,6 +558,7 @@ async function followupSteers() {
   }
 }
 function acceptSteer(message) {
+  if (message.reconfigure) message.selection = modelSelection(message);
   pendingSteers.push(message);
   if (turnActive) {
     if (!preemptForSteer()) void pumpSteers().catch(fatal);
@@ -561,6 +582,7 @@ async function runTurn(prompt, ready, accepted) {
     accepted?.();
     let thisRun = null;
     run = thisRun = await agent.send(prompt, {
+      ...(modelChanged ? { model: currentModel } : {}),
       onDelta: ({ update }) => {
         if (thisRun && thisRun === preemptedRun) return;
         try {
@@ -636,6 +658,7 @@ function modelSelection(msg) {
 
 async function start(msg) {
   const model = modelSelection(msg);
+  currentModel = model;
   // The SDK loads NO ambient settings unless asked: without settingSources the
   // user's ~/.cursor/mcp.json and plugins are invisible and the inline zeron
   // server is the only MCP the agent sees. "project" (and so "all") is left

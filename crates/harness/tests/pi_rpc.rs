@@ -760,3 +760,49 @@ async fn late_extension_notifications_do_not_reopen_completed_turns() {
         1
     );
 }
+
+/// A model or thinking switch reaches the live process before the message
+/// it was sent with: no new process, no lost session.
+#[tokio::test]
+async fn a_model_switch_applies_to_the_live_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut opening = request(dir.path(), "which-model");
+    opening.model = Some("mock/mock".into());
+    let mut switched = opening.clone();
+    switched.model = Some("mock/mock-2".into());
+    switched.reasoning = Some(zeron_proto::ReasoningLevel::High);
+    let driver = harness().with_session_store(dir.path().join("index"));
+    assert!(driver.reconfigures_in_place(&opening, &switched));
+    let mut stream = driver.run(opening, c).await.unwrap();
+    let mut text = String::new();
+    let mut dones = 0;
+    let mut started = 0;
+    while dones < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match event {
+            AgentEvent::SessionStarted { .. } => started += 1,
+            AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+            AgentEvent::Done { .. } => {
+                dones += 1;
+                text.push('|');
+                if dones == 1 {
+                    tx.send(SteerMessage {
+                        config: Some(Box::new(switched.clone())),
+                        ..SteerMessage::text("which-model")
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started, 1);
+    assert!(text.contains("reply:mock/medium|"), "{text}");
+    assert!(text.contains("reply:mock-2/high|"), "{text}");
+}

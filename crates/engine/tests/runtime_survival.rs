@@ -742,16 +742,24 @@ async fn the_idle_reaper_spares_a_runtime_holding_background_work() {
     let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
     turn.set_background(1);
 
-    // Far past the 30-minute idle window: the scout is still running.
-    tokio::time::sleep(Duration::from_secs(3 * 60 * 60)).await;
+    // Far past the 30-minute idle window: the scout is still running. (The
+    // odd 20 minutes put its end mid-way through a deferred window.)
+    tokio::time::sleep(Duration::from_secs(3 * 60 * 60 + 20 * 60)).await;
     assert!(
         rig.core.sessions.live_run_steerable(CHAT),
         "the reaper killed a runtime holding live background work"
     );
     assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
 
-    // Once the background work is done, an idle runtime is released again.
+    // Once the background work is done, an idle runtime is released again —
+    // but not before a full idle window has passed since: the completion's
+    // wake turn starts a moment after the agent reports the work drained.
     turn.set_background(0);
+    tokio::time::sleep(Duration::from_secs(29 * 60)).await;
+    assert!(
+        rig.core.sessions.live_run_steerable(CHAT),
+        "the reaper killed the runtime as its background work ended"
+    );
     tokio::time::sleep(Duration::from_secs(2 * 60 * 60)).await;
     wait_for(
         || rig.ledger.kills.load(Ordering::SeqCst) == 1,

@@ -2305,6 +2305,10 @@ async fn drive_run(
     // `TurnControl::background_live`) is not idle: reaping it killed that
     // work. The reaper re-checks a full idle window later instead.
     let mut reap_deferred_until: Option<tokio::time::Instant> = None;
+    // The reaper last deferred for background work. Its end is not idleness
+    // either: the agent reports the drained set a moment before the turn the
+    // completion wakes, and reaping in that gap lost the wake (issue #831).
+    let mut held_for_background = false;
     let steerable = harness.supports_steering();
     let stops_turn_in_place = steerable && harness.stops_turn_in_place();
     // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
@@ -2456,6 +2460,12 @@ async fn drive_run(
                     // the runtime for as long as that work lives.
                     if turn.background_live() {
                         tracing::info!(chat = %chat_id, "idle reaper deferred: the agent reports background work");
+                        reap_deferred_until = Some(tokio::time::Instant::now() + session_idle);
+                        held_for_background = true;
+                        continue;
+                    }
+                    if std::mem::take(&mut held_for_background) {
+                        // The work just ended: a full idle window from here.
                         reap_deferred_until = Some(tokio::time::Instant::now() + session_idle);
                         continue;
                     }
