@@ -32,6 +32,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let token = CancellationToken::new();
     (
         RunControls {
+            realtime: None,
             execution_lease: None,
             steering: rx,
             interrupt: token.clone(),
@@ -40,6 +41,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
                 let _ = tx.send(vec![]);
                 rx
             }),
+            turn: Default::default(),
         },
         tx,
         token,
@@ -214,6 +216,8 @@ async fn steers_confirm_on_consumption_and_interrupt_is_terminal_once() {
     tx.send(SteerMessage {
         prompt: "redirect".into(),
         message_id: Some("user-id".into()),
+        attachments: Vec::new(),
+        config: None,
     })
     .await
     .unwrap();
@@ -262,6 +266,8 @@ async fn idle_mailbox_starts_another_turn_without_restarting_process() {
                         tx.send(SteerMessage {
                             prompt: "second".into(),
                             message_id: None,
+                            attachments: Vec::new(),
+                            config: None,
                         })
                         .await
                         .unwrap();
@@ -509,6 +515,8 @@ async fn steering_burst_reaches_one_model_step_and_confirms_each_message_on_cons
             tx.send(SteerMessage {
                 prompt: prompt.clone(),
                 message_id: Some(format!("user-{i}")),
+                attachments: Vec::new(),
+                config: None,
             })
             .await
             .unwrap();
@@ -588,6 +596,8 @@ async fn handled_input_between_steers_keeps_its_own_delivery_receipt() {
             tx.send(SteerMessage {
                 prompt: prompt.into(),
                 message_id: None,
+                attachments: Vec::new(),
+                config: None,
             })
             .await
             .unwrap();
@@ -726,6 +736,8 @@ async fn late_extension_notifications_do_not_reopen_completed_turns() {
     tx.send(SteerMessage {
         prompt: "next".into(),
         message_id: None,
+        attachments: Vec::new(),
+        config: None,
     })
     .await
     .unwrap();

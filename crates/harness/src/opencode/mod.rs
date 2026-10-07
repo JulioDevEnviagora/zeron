@@ -61,7 +61,8 @@ use tokio::sync::mpsc;
 
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SlashCommand, SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
+    RunRequest, SlashCommand, SteeringMode, TodoItem, TodoStatus, ToolCall, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::process::{Child, Command, Stdio};
@@ -1487,6 +1488,7 @@ async fn run_session(session: Session) {
         initial_native_command_selected,
     } = session;
     let RunControls {
+        realtime: _,
         execution_lease: _execution_lease,
         request_input,
         mut steering,
@@ -3671,13 +3673,13 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|t| TodoItem {
-                    text: t
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    done: t.get("status").and_then(Value::as_str) == Some("completed"),
+                .map(|t| {
+                    TodoItem::new(
+                        t.get("content").and_then(Value::as_str).unwrap_or_default(),
+                        TodoStatus::parse(
+                            t.get("status").and_then(Value::as_str).unwrap_or_default(),
+                        ),
+                    )
                 })
                 .collect(),
         },
