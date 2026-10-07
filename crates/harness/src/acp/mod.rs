@@ -3550,7 +3550,7 @@ async fn select_session_config(
         let advertised = devin_models::wait_for_model(
             client,
             incoming,
-            &session_id,
+            session_id,
             &mut session_response,
             &model,
             &selection.members,
