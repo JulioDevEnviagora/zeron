@@ -1735,12 +1735,17 @@ async fn run_session(session: Session) {
     let mut pending_spawns: VecDeque<PendingSpawn> = VecDeque::new();
     // Child sessions created before their spawn chip was seen (id → title).
     let mut unbound_children: HashMap<String, String> = HashMap::new();
-    let mut queued_steers: VecDeque<(String, bool)> = VecDeque::new();
+    // Steers waiting for the turn's end: text, whether it selects a native
+    // command, and the images it carries.
+    let mut queued_steers: VecDeque<(String, bool, Vec<String>)> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupt_requested = false;
     // A turn stop (`TurnControl::stop_turn`) in flight: the session is
     // aborted like an interrupt, but the server and session stay up.
     let mut stopping = false;
+    // A stop the server never acknowledged: the turn may still be running,
+    // so the runtime is torn down and the stop reported only once it is gone.
+    let mut stop_teardown = false;
     let mut pending_usage: Option<AgentEvent> = None;
     let mut done_sent = false;
 
@@ -1783,16 +1788,18 @@ async fn run_session(session: Session) {
                 abort_deadline = None;
                 continue $label;
             }
-            if let Some((first, native_command_selected)) = queued_steers.pop_front() {
+            if let Some((first, native_command_selected, mut attachments)) = queued_steers.pop_front() {
                 turn_generation = turn_generation.wrapping_add(1);
                 // Plain-text steers waiting together go out as one prompt,
                 // each confirmed by its own Steered boundary; a native
                 // command always travels alone.
                 let mut texts = vec![first];
                 while !native_command_selected
-                    && queued_steers.front().is_some_and(|(_, native)| !native)
+                    && queued_steers.front().is_some_and(|(_, native, _)| !native)
                 {
-                    texts.push(queued_steers.pop_front().expect("front checked").0);
+                    let (text, _, images) = queued_steers.pop_front().expect("front checked");
+                    texts.push(text);
+                    attachments.extend(images);
                 }
                 let mut consumer_gone = false;
                 for _ in &texts {
@@ -1822,7 +1829,7 @@ async fn run_session(session: Session) {
                     TurnSpec {
                         model: model.as_ref(),
                         variant: variant.as_deref(),
-                        attachments: &[],
+                        attachments: &attachments,
                     },
                 )
                 .await
@@ -1938,8 +1945,14 @@ async fn run_session(session: Session) {
                     if matches!(abort, Ok(Ok(_))) {
                         abort_deadline = Some(tokio::time::Instant::now() + interrupt_grace);
                     } else {
-                        // No acknowledgement is coming: settle the turn now.
-                        settle_idle!('main);
+                        // The turn may still be running: this session must
+                        // never take a prompt on top of it.
+                        tracing::warn!(
+                            target: "zeron_harness::opencode",
+                            "turn stop abort failed; tearing the runtime down"
+                        );
+                        stop_teardown = true;
+                        break 'main;
                     }
                 } else if !turn.active {
                     // Between turns: nothing to abort. Settle the stop so the
@@ -2034,7 +2047,11 @@ async fn run_session(session: Session) {
                             HarnessId::Opencode,
                         );
                         if turn.active {
-                            queued_steers.push_back((prompt, native_command_selected));
+                            queued_steers.push_back((
+                                prompt,
+                                native_command_selected,
+                                steer.attachments,
+                            ));
                             maybe_preempt!();
                         } else {
                             turn_generation = turn_generation.wrapping_add(1);
@@ -2099,8 +2116,13 @@ async fn run_session(session: Session) {
             _ = stall_sleep => {
                 if abort_deadline.is_some() && stopping {
                     // The stop's abort acknowledged nothing within the grace:
-                    // settle the turn and keep the session.
-                    settle_idle!('main);
+                    // the turn may still be running. Tear the runtime down.
+                    tracing::warn!(
+                        target: "zeron_harness::opencode",
+                        "turn stop unacknowledged; tearing the runtime down"
+                    );
+                    stop_teardown = true;
+                    break 'main;
                 }
                 if abort_deadline.is_some() {
                     // Abort acknowledged nothing within the grace: hard stop.
@@ -2200,10 +2222,15 @@ async fn run_session(session: Session) {
                         if interrupt_requested || stopping {
                             // Only the terminal idle/interrupt acknowledgement may
                             // affect an aborted turn; discard late content and usage.
-                            let kind = event.get("type").and_then(Value::as_str);
-                            let ours = event.pointer("/properties/sessionID").and_then(Value::as_str) == Some(session_id.as_str());
+                            // v1's /global/event wraps it ({payload}), like
+                            // `handle_bus_event` reads: matching the envelope
+                            // missed every acknowledgement, and each stop
+                            // waited out the grace.
+                            let payload = event.get("payload").unwrap_or(&event);
+                            let kind = payload.get("type").and_then(Value::as_str);
+                            let ours = payload.pointer("/properties/sessionID").and_then(Value::as_str) == Some(session_id.as_str());
                             let idle = kind == Some("session.idle") || kind == Some("session.interrupted")
-                                || (kind == Some("session.status") && event.pointer("/properties/status/type").and_then(Value::as_str) == Some("idle"));
+                                || (kind == Some("session.status") && payload.pointer("/properties/status/type").and_then(Value::as_str) == Some("idle"));
                             if ours && idle { settle_idle!('main); }
                             continue;
                         }
@@ -2243,6 +2270,25 @@ async fn run_session(session: Session) {
         }
     }
 
+    if stop_teardown {
+        // Close the mailbox before the stop reads settled: the next prompt
+        // must start a fresh runtime, never land in this one.
+        drop(steering);
+        bus_handle.abort();
+        server.shutdown(kill_grace).await;
+        settle_children(&mut children, &event_tx, DoneStatus::Interrupted).await;
+        let _ = send(
+            &event_tx,
+            AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                result: None,
+                error: None,
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .await;
+        return;
+    }
     if !done_sent {
         // Consumer went away (stream dropped): nothing to report to.
         tracing::debug!(target: "zeron_harness::opencode", "run loop ended without settling");

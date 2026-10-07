@@ -38,10 +38,13 @@ struct Ledger {
     turn: Mutex<Option<TurnControl>>,
     /// The model each in-place reconfiguration switched the process to.
     reconfigured: Mutex<Vec<Option<String>>>,
+    /// The model each process was spawned with.
+    spawned_models: Mutex<Vec<Option<String>>>,
 }
 
 /// One persistent agent process per `run()`. A prompt containing `hold`
-/// stays in flight until stopped; any other prompt completes at once.
+/// stays in flight until stopped; any other prompt completes at once. A
+/// steer containing `vanish` kills the process before it confirms the steer.
 struct ProcessHarness {
     ledger: Arc<Ledger>,
     /// Model changes apply to the live process (`set_model`-style).
@@ -93,6 +96,11 @@ impl Harness for ProcessHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let ledger = self.ledger.clone();
         ledger.spawns.fetch_add(1, Ordering::SeqCst);
+        ledger
+            .spawned_models
+            .lock()
+            .unwrap()
+            .push(request.model.clone());
         *ledger.turn.lock().unwrap() = Some(controls.turn.clone());
         let (tx, rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(64);
         tokio::spawn(async move {
@@ -142,6 +150,9 @@ impl Harness for ProcessHarness {
                     }
                     steer = controls.steering.recv() => {
                         let Some(steer) = steer else { return };
+                        if steer.prompt.contains("vanish") {
+                            return;
+                        }
                         if let Some(config) = &steer.config {
                             ledger.reconfigured.lock().unwrap().push(config.model.clone());
                         }
@@ -349,6 +360,65 @@ async fn a_model_switch_is_adopted_by_the_live_runtime() {
         .unwrap();
     settle(&rig, 4).await;
     assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 2);
+    rig.core.sessions.shutdown().await;
+}
+
+/// A message the runtime accepted but died before confirming is replayed as
+/// it was sent — its images and configuration included, under its own id —
+/// not as the chat's latest request with the images stripped.
+#[tokio::test]
+async fn a_message_orphaned_by_a_dying_runtime_replays_as_sent() {
+    let rig = rig_with(true);
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("hold: working"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "the agent to be running the turn",
+    )
+    .await;
+
+    let mut sent = request("vanish: what is in this screenshot?");
+    sent.model = Some("process-2".into());
+    sent.attachments = vec!["/tmp/shot.png".into()];
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, sent, Some("m-orphan".into()))
+        .await
+        .unwrap();
+    settle(&rig, 2).await;
+
+    assert_eq!(
+        rig.ledger.spawns.load(Ordering::SeqCst),
+        2,
+        "a fresh runtime"
+    );
+    assert_eq!(
+        rig.ledger.prompts.lock().unwrap()[1],
+        ("vanish: what is in this screenshot?".to_string(), 1),
+        "the image survived the replay"
+    );
+    assert_eq!(
+        rig.ledger.spawned_models.lock().unwrap()[1].as_deref(),
+        Some("process-2"),
+        "the configuration it was sent with"
+    );
+    let entries = rig
+        .core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap();
+    let orphan: Vec<_> = entries
+        .iter()
+        .filter(|e| e.role == zeron_doc::MessageRole::User && e.id != entries[0].id)
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(orphan, ["m-orphan"], "one entry, under its own id");
     rig.core.sessions.shutdown().await;
 }
 
@@ -613,6 +683,45 @@ async fn a_steer_sent_before_stop_is_cancelled_with_it() {
         "nothing re-ran"
     );
     assert_eq!(status(&rig.core), Some(SessionStatus::Idle));
+    rig.core.sessions.shutdown().await;
+}
+
+/// The idle reaper spares a parked runtime holding background work, so the
+/// user's Stop must reach it and end that work.
+#[tokio::test]
+async fn stop_ends_a_parked_runtime_holding_background_work() {
+    let rig = rig();
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            request("launch a background scout"),
+            None,
+        )
+        .await
+        .unwrap();
+    settle(&rig, 1).await;
+    // A runtime parked with nothing running is left alone.
+    rig.core
+        .doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+
+    let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
+    turn.set_background(1);
+    rig.core
+        .doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    wait_for(
+        || rig.ledger.kills.load(Ordering::SeqCst) == 1,
+        "the Stop to end the background work",
+    )
+    .await;
+    assert!(!rig.core.sessions.live_run_steerable(CHAT));
     rig.core.sessions.shutdown().await;
 }
 

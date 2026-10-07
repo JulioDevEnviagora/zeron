@@ -475,6 +475,33 @@ case "$turnline" in
   cat >/dev/null
   ;;
 
+*scenario:reconfigure*)
+  # Model changes sent mid-turn (A -> B -> A, then a plain follow-up): none
+  # may ride turn/steer, which carries no model. Each starts its own turn
+  # with the configuration it was sent with.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"working"}}'
+  sleep 0.5
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"completed"}}}'
+  n=2
+  for want in 'to-b|"model":"model-b"|"effort":"low"' \
+    'back-to-a|"model":"gpt-5.6-sol"|"effort":"ultra"' \
+    'plain|"model":"gpt-5.6-sol"|"effort":"ultra"'; do
+    read -r next || exit 1
+    text=${want%%|*}; rest=${want#*|}; model=${rest%%|*}; effort=${rest#*|}
+    { has "$next" '"method":"turn/start"' && has "$next" "\"text\":\"$text\"" \
+      && has "$next" "$model" && has "$next" "$effort"; } \
+      || { fail_turn "$(rid "$next")" "turn $n: wanted $text with $model $effort"; exit 0; }
+    emit "{\"id\":$(rid "$next"),\"result\":{\"turn\":{\"id\":\"t-$n\"}}}"
+    emit "{\"method\":\"turn/started\",\"params\":{\"turn\":{\"id\":\"t-$n\"}}}"
+    emit "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"m$n\",\"delta\":\"$text\"}}"
+    emit "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"t-$n\",\"status\":\"completed\"}}}"
+    n=$((n + 1))
+  done
+  cat >/dev/null
+  ;;
+
 *scenario:wedge*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'

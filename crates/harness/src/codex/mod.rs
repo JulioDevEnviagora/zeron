@@ -1319,7 +1319,9 @@ async fn run_session(session: Session) {
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    // Each carries the configuration it was sent with, adopted when its own
+    // `turn/start` goes out.
+    let mut queued_steers: VecDeque<(String, Option<Box<RunRequest>>)> = VecDeque::new();
     // Steers the app-server accepted into the running turn, by the
     // `clientUserMessageId` they were sent with. Each is confirmed
     // (`Steered`) when its userMessage item joins the turn — not when
@@ -1617,7 +1619,10 @@ async fn run_session(session: Session) {
                         // this turn's end becomes the next turn now; otherwise
                         // stay alive for the mailbox — the caller owns teardown.
                         current_native = false;
-                        if let Some(text) = queued_steers.pop_front() {
+                        if let Some((text, config)) = queued_steers.pop_front() {
+                            if let Some(next) = config {
+                                live = *next;
+                            }
                             current_native = command_request(&text, &thread_id).ok().flatten().is_some();
                             if !steer_as_new_turn(
                                 &client,
@@ -1761,17 +1766,25 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    if let Some(next) = msg.config {
-                        live = *next;
-                    }
                     let text = msg.prompt;
                     // Native operations run at a turn boundary, never as text
-                    // injected into an already running model turn. Later messages
-                    // must stay behind queued commands: Steered acknowledgments
-                    // retire the engine's accepted-message ledger in FIFO order.
-                    if !done_current && (!queued_steers.is_empty() || current_native || !matches!(command_request(&text, &thread_id), Ok(None))) {
-                        queued_steers.push_back(text);
+                    // injected into an already running model turn. So does a
+                    // changed configuration: `turn/steer` carries no model,
+                    // effort or tier, and only a `turn/start` applies them.
+                    // Later messages must stay behind queued ones: Steered
+                    // acknowledgments retire the engine's accepted-message
+                    // ledger in FIFO order.
+                    if !done_current
+                        && (!queued_steers.is_empty()
+                            || current_native
+                            || msg.config.is_some()
+                            || !matches!(command_request(&text, &thread_id), Ok(None)))
+                    {
+                        queued_steers.push_back((text, msg.config));
                         continue 'main;
+                    }
+                    if let Some(next) = msg.config {
+                        live = *next;
                     }
                     if let Some(expected) = router.active.clone() {
                         let client_id = new_message_id();
@@ -1797,7 +1810,7 @@ async fn run_session(session: Session) {
                                 if router.active.as_deref() == Some(expected.as_str())
                                     && !router.is_completed(&expected)
                                 {
-                                    queued_steers.push_back(text);
+                                    queued_steers.push_back((text, None));
                                 } else {
                                     current_native = command_request(&text, &thread_id).ok().flatten().is_some();
                                     if !steer_as_new_turn(

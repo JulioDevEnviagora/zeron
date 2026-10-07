@@ -191,6 +191,10 @@ struct RoutedSteer {
     /// Accepted after the user's Stop began tearing the runtime down: the
     /// Stop did not cancel it, so the message still runs.
     after_stop: bool,
+    /// The run configuration it was sent with, images included: an orphan
+    /// re-dispatches exactly this, not whatever the chat's latest request
+    /// became. `None` when the chat had no recorded request.
+    request: Option<Box<RunRequest>>,
 }
 
 struct Inner {
@@ -365,6 +369,14 @@ impl SessionsEngine {
         lock(&self.inner.statuses)
             .get(chat_id)
             .is_some_and(is_active)
+    }
+
+    /// Whether the chat's live runtime reports background work (subagents,
+    /// background shells) still running — parked or not.
+    pub fn holds_background_work(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.turn.background_live())
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -620,6 +632,7 @@ impl SessionsEngine {
                                 message_id: user_id.clone(),
                                 fork_history: bootstrap.is_some(),
                                 after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
+                                request: Some(Box::new(request.clone())),
                             });
                             permit.send(message);
                         })
@@ -896,6 +909,13 @@ impl SessionsEngine {
         let user_id = message_id.unwrap_or_else(new_id);
         let bootstrap = self.warm_fork_history(chat_id, harness_id, prompt, &history_sent);
         let delivered = bootstrap.as_deref().unwrap_or(prompt);
+        // A steer runs on the configuration live now; record it with the
+        // message so a re-dispatch keeps it.
+        let sent_with = self.last_request(chat_id).map(|mut request| {
+            request.prompt = prompt.to_string();
+            request.attachments = Vec::new();
+            Box::new(request)
+        });
         let message = SteerMessage {
             prompt: if harness_id == HarnessId::Opencode {
                 delivered.to_owned()
@@ -922,6 +942,7 @@ impl SessionsEngine {
                 message_id: user_id.clone(),
                 fork_history: bootstrap.is_some(),
                 after_stop: retiring.load(std::sync::atomic::Ordering::Acquire),
+                request: sent_with,
             });
             permit.send(message);
         });
@@ -3239,13 +3260,16 @@ async fn drive_run(
         let chat = chat_id.clone();
         tokio::spawn(async move {
             for steer in orphans {
-                let Some(mut request) = engine.last_request(&chat) else {
+                let Some(mut request) = steer
+                    .request
+                    .map(|request| *request)
+                    .or_else(|| engine.last_request(&chat))
+                else {
                     tracing::warn!(chat = %chat, "orphaned steer lost: no run config to re-dispatch");
                     break;
                 };
                 request.prompt = steer.prompt.clone();
                 request.resume = None;
-                request.attachments = Vec::new();
                 tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
                 let Some(host) = engine.inner.doc_host() else {
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");

@@ -1732,6 +1732,68 @@ async fn ordinary_followup_cannot_overtake_a_queued_native_command() {
 }
 
 #[tokio::test]
+async fn a_model_change_sent_mid_turn_takes_effect_in_its_own_turn() {
+    let (controls, steer, _token) = controls("Yes");
+    let mut stream = harness()
+        .run(request("scenario:reconfigure"), controls)
+        .await
+        .expect("run starts");
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        let working = event
+            == AgentEvent::TextDelta {
+                text: "working".into(),
+            };
+        events.push(event);
+        if working {
+            break;
+        }
+    }
+    let mut model_b = request("");
+    model_b.model = Some("model-b".into());
+    model_b.reasoning = Some(ReasoningLevel::Low);
+    for (text, config) in [
+        ("to-b", Some(model_b)),
+        ("back-to-a", Some(request(""))),
+        ("plain", None),
+    ] {
+        steer
+            .send(SteerMessage {
+                config: config.map(Box::new),
+                ..SteerMessage::text(text)
+            })
+            .await
+            .unwrap();
+    }
+    let mut completed = 0;
+    while completed < 4 {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        if let AgentEvent::Done { status, error, .. } = &event {
+            assert_eq!(*status, DoneStatus::Completed, "{error:?}");
+            completed += 1;
+        }
+        events.push(event);
+    }
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["working", "to-b", "back-to-a", "plain"]);
+}
+
+#[tokio::test]
 async fn a_stopped_turn_keeps_the_app_server_for_the_next_prompt() {
     use zeron_harness::TurnControl;
     let (mut controls, steer, _token) = controls("Yes");

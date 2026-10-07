@@ -4131,13 +4131,17 @@ impl DocHost {
     /// Stop the active turn without treating the resulting Idle transition as
     /// permission to release the next queued message. The same lock used by
     /// drains closes the race between clicking Cancel and the status watcher.
+    /// A parked runtime still running background work is stopped too: the
+    /// idle reaper spares it, so Stop is what ends that work.
     async fn interrupt_and_pause_queue(
         &self,
         sessions: &SessionsEngine,
         handle: &Arc<ChatDocHandle>,
     ) -> Result<bool, EngineError> {
         let _drain = handle.drain_lock.lock().await;
-        if !sessions.turn_in_flight(&handle.chat_id) {
+        if !sessions.turn_in_flight(&handle.chat_id)
+            && !sessions.holds_background_work(&handle.chat_id)
+        {
             return Ok(false);
         }
         handle.queue_paused.store(true, Ordering::Release);
