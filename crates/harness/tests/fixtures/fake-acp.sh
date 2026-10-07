@@ -200,6 +200,17 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:detached*)
+  # A command the agent starts in its own session (Devin does): not in the
+  # agent's process group, so a group kill alone leaves it running.
+  pidfile=$(printf '%s' "$promptline" | sed 's/.*scenario:detached \([^ "]*\).*/\1/')
+  python3 -c "import os,time; os.setsid(); open('$pidfile','w').write(str(os.getpid())); time.sleep(60)" &
+  while [ ! -s "$pidfile" ]; do sleep 0.05; done
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
+  ;;
+
 *scenario:reconfigure*)
   # Model switches: one sent between turns, one sent mid-turn. Each set must
   # reach the session before the prompt it was sent with.

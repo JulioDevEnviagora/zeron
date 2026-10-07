@@ -560,6 +560,14 @@ pub struct ChatDocHandle {
     /// Queue rows held as explicit steers for a turn-boundary agent. They
     /// lead ordinary queued rows, in the order they were steered.
     steered_rows: Mutex<Vec<String>>,
+    /// Sends held for a turn-boundary agent's turn end (rather than queued
+    /// by the user), with the run configuration each was sent with: the row
+    /// carries only its text and images.
+    held_sends: Mutex<HashMap<String, zeron_proto::RunRequest>>,
+    /// The latest Stop command that has acted. A prompt sent before it that
+    /// only executes now (a loaded host, a slow agent) was cancelled by it:
+    /// running it would start the stopped work again in a fresh runtime.
+    stopped_by: Mutex<Option<String>>,
     /// An explicit user interrupt freezes automatic queue delivery. The next
     /// explicit prompt or queue send resumes it; incidental doc/status changes
     /// must not turn Cancel into "send the next row".
@@ -650,6 +658,47 @@ impl Drop for ChatDocHandle {
 }
 
 impl ChatDocHandle {
+    /// The turn ending now is followed at once by a message the user has
+    /// already sent: one still on its way through the command log (a burst
+    /// the agent outran), or one held for a turn-boundary agent's turn end.
+    /// The work goes on, so the end is not a completion to notify.
+    pub(crate) fn continues_with_sent_message(&self) -> bool {
+        // Not yet in the transcript: delivery writes the user's message
+        // before dispatching it, so the command that started the turn now
+        // ending (still marked pending a moment longer) never counts.
+        let in_flight = self.doc.read_commands().is_ok_and(|commands| {
+            let pending: Vec<&str> = commands
+                .iter()
+                .filter(|c| c.status == SessionCommandStatus::Pending)
+                .filter_map(|c| match &c.payload {
+                    SessionCommandPayload::Run { message_id, .. } => Some(message_id.as_str()),
+                    SessionCommandPayload::Steer { message_id, .. } => {
+                        Some(message_id.as_deref().unwrap_or(c.id.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            !pending.is_empty()
+                && self.doc.read_entries().is_ok_and(|entries| {
+                    pending
+                        .iter()
+                        .any(|id| !entries.iter().any(|e| e.id == *id))
+                })
+        });
+        if in_flight {
+            return true;
+        }
+        if self.queue_paused.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(Some(head)) = self.doc.read_queue().map(|q| q.into_iter().next()) else {
+            return false;
+        };
+        head.delivery_gate.is_none()
+            && (lock(&self.held_sends).contains_key(&head.id)
+                || lock(&self.steered_rows).contains(&head.id))
+    }
+
     /// Live views and agents retain their documents and resist idle retirement.
     /// At capacity their transports can yield without dropping these leases.
     fn sync_protected(&self) -> bool {
@@ -1529,6 +1578,8 @@ impl DocHost {
             drain_lock: tokio::sync::Mutex::new(()),
             command_drain_lock: tokio::sync::Mutex::new(()),
             steered_rows: Mutex::new(Vec::new()),
+            held_sends: Mutex::new(HashMap::new()),
+            stopped_by: Mutex::new(None),
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
@@ -4145,6 +4196,7 @@ impl DocHost {
             return Ok(false);
         }
         handle.queue_paused.store(true, Ordering::Release);
+        self.cancel_held_sends(handle);
         match sessions.interrupt(&handle.chat_id).await {
             Ok(true) => Ok(true),
             Ok(false) => {
@@ -4155,6 +4207,33 @@ impl DocHost {
                 handle.queue_paused.store(false, Ordering::Release);
                 Err(err)
             }
+        }
+    }
+
+    /// A Stop cancels the messages sent during the turn it stops: the sends
+    /// and steers held for that turn's end leave the queue (the user's own
+    /// queued rows stay, paused) and land in the transcript unrun — never
+    /// to start the stopped work again in the next runtime.
+    fn cancel_held_sends(&self, handle: &Arc<ChatDocHandle>) {
+        let held: Vec<String> = {
+            let mut sends = lock(&handle.held_sends);
+            let mut steered = lock(&handle.steered_rows);
+            let ids = sends.keys().cloned().chain(steered.drain(..)).collect();
+            sends.clear();
+            ids
+        };
+        let mut changed = false;
+        for id in held {
+            let Ok(Some(row)) = handle.doc.take_queued(&id) else {
+                continue;
+            };
+            changed = true;
+            if let Err(err) = handle.write_user_message(&row.id, &row.text, row.issued_at) {
+                tracing::warn!(chat = %handle.chat_id, error = %err, "cancelled held send write failed");
+            }
+        }
+        if changed {
+            handle.publish_queue();
         }
     }
 
@@ -4180,7 +4259,14 @@ impl DocHost {
             ));
         }
         let mut attachments = item.attachments.clone();
-        let mut prompt = queued_message_prompt(&item.text, &attachments);
+        // A send held for the turn end goes out exactly as it was sent: its
+        // text never carried the queue's image note.
+        let held = lock(&handle.held_sends).remove(&item.id);
+        let mut prompt = if held.is_some() {
+            item.text.clone()
+        } else {
+            queued_message_prompt(&item.text, &attachments)
+        };
         self.resolve_attachment_refs(&mut prompt, &mut attachments);
         if send == QueueSend::Steer {
             match sessions
@@ -4206,16 +4292,18 @@ impl DocHost {
             sessions.stop_turn(chat_id).await?;
         }
         let previous = sessions.last_request(chat_id);
-        let request = self
-            .request_from_chat_row(chat_id, &prompt)
-            .map(|mut current| {
-                if let Some(previous) = &previous {
-                    current.auto_approve = previous.auto_approve;
-                    current.worktree = previous.worktree.clone();
-                }
-                current
-            })
-            .or(previous);
+        // ... and on its model, effort and options, not the chat's saved ones.
+        let request = held.or_else(|| {
+            self.request_from_chat_row(chat_id, &prompt)
+                .map(|mut current| {
+                    if let Some(previous) = &previous {
+                        current.auto_approve = previous.auto_approve;
+                        current.worktree = previous.worktree.clone();
+                    }
+                    current
+                })
+                .or(previous)
+        });
         let Some(mut request) = request else {
             return Err(EngineError::Other(
                 "no live run and no prior run config".into(),
@@ -5250,6 +5338,27 @@ impl DocHost {
         }
     }
 
+    /// `entry` is a prompt sent before the Stop that has already acted on
+    /// this chat: the Stop cancelled it. Returns its message id.
+    fn cancelled_by_stop(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        entry: &SessionCommandEntry,
+    ) -> Option<String> {
+        let message_id = match &entry.payload {
+            SessionCommandPayload::Run { message_id, .. } => message_id.clone(),
+            SessionCommandPayload::Steer { message_id, .. } => {
+                message_id.clone().unwrap_or_else(|| entry.id.clone())
+            }
+            _ => return None,
+        };
+        let stop = lock(&handle.stopped_by).clone()?;
+        let commands = handle.doc.read_commands().ok()?;
+        let at = commands.iter().position(|c| c.id == entry.id)?;
+        let stop_at = commands.iter().position(|c| c.id == stop)?;
+        (at < stop_at).then_some(message_id)
+    }
+
     async fn execute(
         &self,
         sessions: &SessionsEngine,
@@ -5257,6 +5366,24 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        if let Some(message_id) = self.cancelled_by_stop(handle, entry) {
+            // Still the user's message: it stays in the transcript, unrun.
+            let prompt = match &entry.payload {
+                SessionCommandPayload::Run { request, .. } => request.prompt.clone(),
+                SessionCommandPayload::Steer { prompt, .. } => prompt.clone(),
+                _ => String::new(),
+            };
+            if let Err(err) =
+                handle.write_user_message(&message_id, &prompt, entry.issued_at.min(now_ms()))
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "cancelled message write failed");
+            }
+            tracing::info!(chat = %chat_id, "prompt sent before a Stop that has acted: cancelled");
+            return Ok((
+                SessionCommandStatus::Applied,
+                Some("cancelled by the Stop sent after it".into()),
+            ));
+        }
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
@@ -5338,6 +5465,7 @@ impl DocHost {
                         &request.prompt,
                         entry.issued_at,
                         false,
+                        Some(&request),
                     )?;
                     return Ok((
                         SessionCommandStatus::Applied,
@@ -5384,6 +5512,27 @@ impl DocHost {
             SessionCommandPayload::Interrupt {} => {
                 self.await_earlier_prompts(sessions, handle, &entry.id)
                     .await;
+                *lock(&handle.stopped_by) = Some(entry.id.clone());
+                // Sends before this Stop that are still on their way (a slow
+                // dispatch the wait above gave up on) are cancelled with it.
+                if let Ok(commands) = handle.doc.read_commands()
+                    && let Some(at) = commands.iter().position(|c| c.id == entry.id)
+                {
+                    let earlier = commands[..at]
+                        .iter()
+                        .filter(|c| c.status == SessionCommandStatus::Pending)
+                        .filter_map(|c| match &c.payload {
+                            SessionCommandPayload::Run { message_id, .. } => {
+                                Some(message_id.clone())
+                            }
+                            SessionCommandPayload::Steer { message_id, .. } => {
+                                Some(message_id.clone().unwrap_or_else(|| c.id.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    sessions.cancel_sent_messages(&handle.chat_id, earlier);
+                }
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
@@ -5467,11 +5616,12 @@ impl DocHost {
         prompt: &str,
         issued_at: i64,
         steer: bool,
+        request: Option<&zeron_proto::RunRequest>,
     ) -> Result<(), EngineError> {
         let item = QueuedMessage {
             id: message_id.to_string(),
             text: prompt.to_string(),
-            attachments: Vec::new(),
+            attachments: request.map(|r| r.attachments.clone()).unwrap_or_default(),
             hold_for_turn_end: false,
             issued_by: self.inner.config.device_id.clone(),
             issued_at: issued_at.min(now_ms()),
@@ -5480,6 +5630,9 @@ impl DocHost {
         };
         if handle.doc.read_queue()?.iter().any(|row| row.id == item.id) {
             return Ok(()); // a redelivered command: already held
+        }
+        if let Some(request) = request {
+            lock(&handle.held_sends).insert(item.id.clone(), request.clone());
         }
         if steer {
             handle
@@ -5525,7 +5678,7 @@ impl DocHost {
             && (unsteerable_turn || sessions.defers_to_turn_end(chat_id, None))
         {
             let id = message_id.unwrap_or_else(new_id);
-            self.hold_until_turn_end(handle, &id, &prompt, issued_at, true)?;
+            self.hold_until_turn_end(handle, &id, &prompt, issued_at, true, None)?;
             return Ok((
                 SessionCommandStatus::Applied,
                 Some("held until the turn ends".into()),
@@ -5578,7 +5731,7 @@ impl DocHost {
             }
             SteerOutcome::DeferredByUpdate => {
                 let id = message_id.unwrap_or_else(new_id);
-                self.hold_until_turn_end(handle, &id, &prompt, issued_at, true)?;
+                self.hold_until_turn_end(handle, &id, &prompt, issued_at, true, None)?;
                 // The completed turn's status publication normally re-drains
                 // this queue. Also cover completion racing the enqueue itself.
                 self.drain_queue(handle).await;

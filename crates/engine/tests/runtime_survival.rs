@@ -40,15 +40,21 @@ struct Ledger {
     reconfigured: Mutex<Vec<Option<String>>>,
     /// The model each process was spawned with.
     spawned_models: Mutex<Vec<Option<String>>>,
+    /// Ends a turn whose prompt contains `wait`.
+    release: tokio::sync::Notify,
 }
 
 /// One persistent agent process per `run()`. A prompt containing `hold`
 /// stays in flight until stopped; any other prompt completes at once. A
 /// steer containing `vanish` kills the process before it confirms the steer.
+/// A prompt containing `wait` runs until the test releases it.
 struct ProcessHarness {
     ledger: Arc<Ledger>,
     /// Model changes apply to the live process (`set_model`-style).
     adopts_config: bool,
+    /// Takes input only between turns (Hermes, Antigravity): the engine
+    /// holds sends made mid-turn for the turn's end.
+    turn_boundary: bool,
 }
 
 fn done(status: DoneStatus) -> AgentEvent {
@@ -72,7 +78,11 @@ impl Harness for ProcessHarness {
         true
     }
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
+        if self.turn_boundary {
+            SteeringMode::TurnBoundary
+        } else {
+            SteeringMode::StepBoundary
+        }
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[ReasoningLevel::Medium, ReasoningLevel::High]
@@ -131,12 +141,19 @@ impl Harness for ProcessHarness {
                 text: format!("on it: {}", request.prompt),
             })
             .await;
-            if !holding && !send(done(DoneStatus::Completed)).await {
+            let mut waiting = request.prompt.contains("wait");
+            if !holding && !waiting && !send(done(DoneStatus::Completed)).await {
                 return;
             }
             loop {
                 tokio::select! {
                     biased;
+                    _ = ledger.release.notified(), if waiting => {
+                        waiting = false;
+                        if !send(done(DoneStatus::Completed)).await {
+                            return;
+                        }
+                    }
                     _ = controls.interrupt.cancelled() => {
                         // The process dies, and its background work with it.
                         ledger.kills.fetch_add(1, Ordering::SeqCst);
@@ -166,7 +183,8 @@ impl Harness for ProcessHarness {
                         {
                             return;
                         }
-                        if !holding && !send(done(DoneStatus::Completed)).await {
+                        waiting = steer.prompt.contains("wait");
+                        if !holding && !waiting && !send(done(DoneStatus::Completed)).await {
                             return;
                         }
                     }
@@ -191,11 +209,16 @@ fn rig() -> Rig {
 }
 
 fn rig_with(adopts_config: bool) -> Rig {
+    rig_full(adopts_config, false)
+}
+
+fn rig_full(adopts_config: bool, turn_boundary: bool) -> Rig {
     let ledger = Arc::new(Ledger::default());
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ProcessHarness {
         ledger: ledger.clone(),
         adopts_config,
+        turn_boundary,
     }));
     let dir = tempfile::tempdir().unwrap();
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
@@ -419,6 +442,253 @@ async fn a_message_orphaned_by_a_dying_runtime_replays_as_sent() {
         .map(|e| e.id.as_str())
         .collect();
     assert_eq!(orphan, ["m-orphan"], "one entry, under its own id");
+    rig.core.sessions.shutdown().await;
+}
+
+/// Every distinct completion ping the chat publishes, recorded until the
+/// returned handle is aborted.
+fn record_pings(rig: &Rig) -> (Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let pings = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sessions = rig.core.sessions.clone();
+    let seen = pings.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            if let Some(ping) = sessions
+                .session_status(CHAT)
+                .and_then(|s| s.last_completed_turn)
+            {
+                let mut seen = seen.lock().unwrap();
+                if seen.last() != Some(&ping) {
+                    seen.push(ping);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+    (pings, task)
+}
+
+fn queued(rig: &Rig) -> Vec<String> {
+    rig.core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .watch_queue()
+        .borrow()
+        .iter()
+        .map(|row| row.text.clone())
+        .collect()
+}
+
+/// A send to a turn-boundary agent mid-turn waits for the turn's end — and
+/// then runs as it was sent (its image, its model), with no "done" ping for
+/// the turn that hands over to it.
+#[tokio::test]
+async fn a_send_held_for_the_turn_end_runs_as_sent_without_a_ping() {
+    let rig = rig_full(true, true);
+    let (pings, recorder) = record_pings(&rig);
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("wait: first"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "the first turn to run",
+    )
+    .await;
+    let mut sent = request("second");
+    sent.model = Some("process-2".into());
+    sent.attachments = vec!["/tmp/shot.png".into()];
+    rig.core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request: sent,
+                message_id: "m-held".into(),
+            },
+        )
+        .unwrap();
+    wait_for(|| queued(&rig) == ["second"], "the send to be held").await;
+
+    rig.ledger.release.notify_one();
+    settle(&rig, 2).await;
+    wait_for(
+        || {
+            rig.core
+                .sessions
+                .session_status(CHAT)
+                .and_then(|s| s.last_completed_turn)
+                .is_some()
+        },
+        "the held send's reply to complete",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    recorder.abort();
+    assert_eq!(
+        rig.ledger.prompts.lock().unwrap()[1],
+        ("second".to_string(), 1),
+        "the held send kept its image"
+    );
+    assert_eq!(
+        *rig.ledger.reconfigured.lock().unwrap(),
+        vec![Some("process-2".to_string())],
+        "the held send ran on the model it was sent with"
+    );
+    assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 1);
+    let last_reply = rig
+        .core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap()
+        .last()
+        .map(|e| e.id.clone())
+        .unwrap();
+    assert_eq!(
+        *pings.lock().unwrap(),
+        vec![last_reply],
+        "only the held send's reply pings: the handover to it is not a completion"
+    );
+    rig.core.sessions.shutdown().await;
+}
+
+/// A Stop cancels what was sent during the turn it stops: a send held for
+/// that turn's end never runs — not even after the user's next message
+/// thaws the queue.
+#[tokio::test]
+async fn stop_cancels_sends_held_for_the_stopped_turn() {
+    let rig = rig_full(false, true);
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("wait: first"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "the first turn to run",
+    )
+    .await;
+    rig.core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request: request("held before the stop"),
+                message_id: "m-held".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || queued(&rig) == ["held before the stop"],
+        "the send to be held",
+    )
+    .await;
+    rig.core
+        .doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    wait_for(
+        || {
+            rig.ledger.kills.load(Ordering::SeqCst) == 1
+                && status(&rig.core) == Some(SessionStatus::Idle)
+                && queued(&rig).is_empty()
+        },
+        "the stop to cancel the held send",
+    )
+    .await;
+    rig.core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request: request("after the stop"),
+                message_id: "m-after".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            rig.ledger
+                .prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p == "after the stop")
+        },
+        "the next message to run",
+    )
+    .await;
+    settle(&rig, 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !rig.ledger
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p.contains("held before the stop")),
+        "a send held for the stopped turn ran after the Stop"
+    );
+    rig.core.sessions.shutdown().await;
+}
+
+/// A message sent before a Stop whose dispatch only lands once the Stop
+/// has torn the runtime down (a loaded host, a slow agent) was cancelled by
+/// it: it must not start the stopped work again in a fresh runtime.
+#[tokio::test]
+async fn a_message_the_stop_cancelled_never_reaches_a_fresh_runtime() {
+    let rig = rig();
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("hold: working"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "the agent to be running the turn",
+    )
+    .await;
+    // The Stop acts with the message still on its way …
+    rig.core
+        .sessions
+        .cancel_sent_messages(CHAT, vec!["m-late".into()]);
+    rig.core.sessions.interrupt(CHAT).await.unwrap();
+    // … and the message reaches dispatch only now.
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            request("hold: sent before the stop"),
+            Some("m-late".into()),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.ledger.spawns.load(Ordering::SeqCst),
+        1,
+        "no fresh runtime"
+    );
+    assert_eq!(status(&rig.core), Some(SessionStatus::Idle));
+    // The user's next message still runs.
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            request("after the stop"),
+            Some("m-next".into()),
+        )
+        .await
+        .unwrap();
+    settle(&rig, 2).await;
+    assert_eq!(rig.ledger.prompts.lock().unwrap()[1].0, "after the stop");
     rig.core.sessions.shutdown().await;
 }
 

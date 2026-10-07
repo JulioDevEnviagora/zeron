@@ -202,6 +202,9 @@ struct Inner {
     device_id: String,
     /// The engine is shutting down: dying runs re-dispatch nothing.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Per chat: messages a Stop cancelled while they were still on their
+    /// way (see [`SessionsEngine::cancel_sent_messages`]).
+    cancelled_sends: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// Loopback IPC port this engine serves, once known (0 = not serving):
     /// what the injected `zeron mcp` server dials back into.
     ipc_port: std::sync::atomic::AtomicU16,
@@ -258,6 +261,7 @@ impl SessionsEngine {
                 voice: crate::voice::VoiceManager::default(),
                 device_id,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
+                cancelled_sends: Mutex::new(HashMap::new()),
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
                 journal,
                 registry,
@@ -701,6 +705,16 @@ impl SessionsEngine {
             self.terminate(chat_id).await?;
         }
 
+        // A Stop sent after this message cancelled it while it was on its
+        // way: never start the stopped work again in a fresh runtime.
+        if let Some(id) = &message_id
+            && lock(&self.inner.cancelled_sends)
+                .get_mut(chat_id)
+                .is_some_and(|ids| ids.remove(id))
+        {
+            tracing::info!(chat = %chat_id, "message cancelled by a later Stop: not dispatched");
+            return Ok(String::new());
+        }
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -981,6 +995,19 @@ impl SessionsEngine {
         Ok(SteerOutcome::Accepted)
     }
 
+    /// A Stop acting now cancels these messages, sent before it but still
+    /// on their way: one that reaches dispatch after the runtime went down
+    /// is dropped rather than run in a fresh runtime.
+    pub fn cancel_sent_messages(&self, chat_id: &str, message_ids: Vec<String>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        lock(&self.inner.cancelled_sends)
+            .entry(chat_id.to_string())
+            .or_default()
+            .extend(message_ids);
+    }
+
     /// The user's Stop: a hard boundary. The in-flight turn ends `aborted`
     /// and the runtime goes with it — background subagents, background
     /// shells, everything the agent runs. The next message resumes the
@@ -1143,6 +1170,10 @@ impl SessionsEngine {
                     })
             });
             let attempts = self.inner.journal.resume_attempts(&chat_id);
+            // Fresh: the crashed reply's streaming entry is recent — or no
+            // reply entry reached disk at all (the doc saves on a debounce,
+            // and a kill moments into the turn leaves the user's message as
+            // the transcript's last word), and that message is recent.
             let fresh = handle
                 .doc()
                 .read_entries()
@@ -1152,6 +1183,7 @@ impl SessionsEngine {
                         .iter()
                         .rev()
                         .find(|e| e.status == Some(MessageStatus::Streaming))
+                        .or_else(|| entries.last().filter(|e| e.role == MessageRole::User))
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
@@ -1470,6 +1502,14 @@ impl Inner {
         lock(&self.doc_host).clone()
     }
 
+    /// A message the user already sent follows the turn that is ending
+    /// (see [`crate::doc_host::ChatDocHandle::continues_with_sent_message`]).
+    fn continues_with_sent_message(&self, chat_id: &str) -> bool {
+        self.doc_host()
+            .and_then(|host| host.open(chat_id).ok())
+            .is_some_and(|handle| handle.continues_with_sent_message())
+    }
+
     /// Zeron's own MCP server for a run of `chat_id`: this binary's `zeron
     /// mcp` subcommand, dialing the engine's IPC port and stamped with the
     /// originating chat + device so the agent's side chats link back here.
@@ -1543,7 +1583,17 @@ impl Inner {
     /// never rides `--resume`. An empty stored id is the explicit tombstone —
     /// no resume, no falling through to staler sources.
     fn resume_for(&self, chat_id: &str, cwd: &str) -> Option<String> {
-        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
+        // The same directory, however it is spelled: an agent reports where
+        // it runs with symlinks resolved (`/private/var/…` for `/var/…` on
+        // macOS), and until a turn's Done restores the request's spelling a
+        // mid-turn crash leaves that one stored — a string compare then
+        // started the resumed run in a fresh session, its history gone.
+        let cwd_ok = |session_cwd: &str| {
+            session_cwd.is_empty()
+                || session_cwd == cwd
+                || std::fs::canonicalize(session_cwd)
+                    .is_ok_and(|a| std::fs::canonicalize(cwd).is_ok_and(|b| a == b))
+        };
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
             return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
                 .then_some(known.session_id);
@@ -2574,7 +2624,8 @@ async fn drive_run(
                     // completion notice, but never notify for an empty boundary
                     // or while an accepted steer still awaits delivery.
                     let completed_turn = ((!folded.is_empty() || writer.is_some())
-                        && !inner.has_pending_steers(&chat_id, &run_id))
+                        && !inner.has_pending_steers(&chat_id, &run_id)
+                        && !inner.continues_with_sent_message(&chat_id))
                         .then(|| entry_id.clone());
                     if !folded.is_empty() || writer.is_some() {
                         if let Err(err) = finish_segment(
@@ -3164,13 +3215,16 @@ async fn drive_run(
             }
             // An accepted steer awaiting its boundary owns the continuation:
             // the previous Done is an internal handoff, not a completion ping.
-            // Ordinary queued rows are not in this ledger and still notify.
+            // So does a message the user already sent that is still on its
+            // way (see `continues_with_sent_message`); rows the user queued
+            // themselves still notify.
             let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
             let completed_turn = (*status == DoneStatus::Completed
                 && !interrupted
                 && turn_was_active
-                && !pending_steer)
-                .then(|| entry_id.clone());
+                && !pending_steer
+                && !inner.continues_with_sent_message(&chat_id))
+            .then(|| entry_id.clone());
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for
             // the next routed dispatch; per-turn state resets for it.

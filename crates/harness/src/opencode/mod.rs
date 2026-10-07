@@ -66,7 +66,7 @@ use zeron_proto::{
 };
 
 use crate::process::{Child, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls, shutdown_child};
+use crate::{Harness, HarnessError, RunControls};
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -858,7 +858,8 @@ impl Server {
 
     async fn shutdown(&mut self, kill_grace: Duration) {
         if let Some(child) = self.child.as_mut() {
-            shutdown_child(child, kill_grace).await;
+            // The server and every command it started.
+            crate::shutdown_agent(child, Vec::new(), kill_grace).await;
         }
     }
 

@@ -292,6 +292,53 @@ async fn a_model_switch_is_selected_on_the_live_session() {
     assert_eq!(texts, ["turn1", "on fast", "back on 4.5"]);
 }
 
+/// Tearing the runtime down ends everything the agent started — a command
+/// it ran in its own session included (live, Devin: it outlived quitting
+/// the app).
+#[cfg(unix)]
+#[tokio::test]
+async fn teardown_ends_a_command_the_agent_detached() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("detached.pid");
+    let (controls, _steer, token) = controls();
+    let mut stream = harness()
+        .run(
+            request(&format!("scenario:detached {}", pidfile.display())),
+            controls,
+        )
+        .await
+        .expect("run starts");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        if matches!(event, AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only probes for existence.
+    let alive = || unsafe { libc::kill(pid, 0) } == 0;
+    assert!(alive(), "the detached command runs");
+    token.cancel();
+    while tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("teardown in time")
+        .is_some()
+    {}
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!alive(), "the detached command outlived the runtime");
+}
+
 #[tokio::test]
 async fn resumed_first_class_model_is_switched_before_prompt() {
     let (controls, _steer, _token) = controls();

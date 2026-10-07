@@ -738,6 +738,13 @@ async fn run_session(session: Session) {
         }
     }
 
+    // The SDK runs tools in the shim's process: snapshot them before it
+    // goes, so none outlives the runtime (see [`crate::shutdown_agent`]).
+    #[cfg(unix)]
+    let tree = match child.id() {
+        Some(pid) => crate::process::descendants(pid).await,
+        None => Vec::new(),
+    };
     drop(stdin_tx);
     // EOF asks the shim to cancel/close the SDK and settle its durable state.
     // Signals remain the bounded fallback when the SDK cannot shut down.
@@ -747,6 +754,8 @@ async fn run_session(session: Session) {
     ) {
         shutdown_child(&mut child, kill_grace).await;
     }
+    #[cfg(unix)]
+    crate::process::terminate_tree(&tree, kill_grace).await;
     if let Some(handle) = escalation {
         handle.abort();
     }
