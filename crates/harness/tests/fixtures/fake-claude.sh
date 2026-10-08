@@ -225,6 +225,23 @@ case "$first" in
   cat >/dev/null
   ;;
 
+*scenario:stop-unconfirmed-replacement*)
+  # A CLI that confirms nothing (no command_lifecycle, no replays): a turn is
+  # stopped, and the replacement answers within the stop's settle window.
+  # Its result is its own end, not the stopped turn reporting late.
+  emit '{"type":"system","subtype":"init","model":"claude-sonnet-5-5","tools":[],"cwd":"/tmp","session_id":"sess-su"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}'
+  read -r stop || exit 1
+  case "$stop" in *'"subtype":"interrupt"'*) ;; *) exit 8 ;; esac
+  rid=$(printf '%s\n' "$stop" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"still_queued\":[]}}}"
+  emit '{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-su"}'
+  read -r next || exit 1
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"new reply"}}}'
+  emit '{"type":"result","subtype":"success","is_error":false,"result":"new reply","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-su"}'
+  cat >/dev/null
+  ;;
+
 *scenario:lifecycle-queued-cancelled*)
   # A queued message cancelled before any turn takes it up: the result held
   # for it was the turn's real end, released at once — no quiet timer.

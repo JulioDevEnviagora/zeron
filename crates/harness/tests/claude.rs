@@ -1075,6 +1075,67 @@ async fn send_now_over_a_held_turn_end_never_settles_the_replacement() {
     );
 }
 
+/// After a stop, a replacement that answers within the stop's settle window
+/// from a CLI that confirms nothing (no lifecycle, no replay) still ends: its
+/// result is reconciled like any unconfirmed steer's, never dropped as the
+/// stopped turn reporting late (which left the chat Working).
+#[tokio::test]
+async fn a_quick_unconfirmed_replacement_after_a_stop_still_completes() {
+    use zeron_harness::TurnControl;
+    let (mut controls, steer, _token) = controls("A");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:stop-unconfirmed-replacement"), controls)
+        .await
+        .expect("run starts");
+    macro_rules! next {
+        () => {
+            tokio::time::timeout(Duration::from_secs(15), stream.next())
+                .await
+                .expect("event in time")
+                .expect("stream open")
+                .expect("stream event")
+        };
+    }
+    loop {
+        if matches!(next!(), AgentEvent::TextDelta { text } if text == "working") {
+            break;
+        }
+    }
+    turn.stop_turn();
+    loop {
+        if let AgentEvent::Done { status, .. } = next!() {
+            assert_eq!(status, DoneStatus::Interrupted);
+            break;
+        }
+    }
+    steer.send(steer_msg("replacement")).await.unwrap();
+    let mut after = Vec::new();
+    let end = loop {
+        match next!() {
+            done @ AgentEvent::Done { .. } => break done,
+            event => after.push(event),
+        }
+    };
+    assert!(
+        after.contains(&AgentEvent::TextDelta {
+            text: "new reply".into()
+        }),
+        "{after:?}"
+    );
+    assert!(
+        matches!(
+            end,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ),
+        "{end:?}"
+    );
+}
+
 /// A queued message the CLI cancels before starting releases the held turn
 /// end at once, from the lifecycle frame — not after a quiet timer.
 #[tokio::test]

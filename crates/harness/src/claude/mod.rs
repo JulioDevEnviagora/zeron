@@ -858,11 +858,14 @@ async fn run_session(session: Session) {
     // host started the replacement prompt while the stopped turn could still
     // report, and that late result settled the replacement.
     let mut stopped_end: Option<AgentEvent> = None;
-    // When the stopped turn's one Done went out, and whether a message of
-    // ours has started a turn since: a result in between is that stopped
-    // turn reporting late, and is dropped.
+    // When the stopped turn's one Done went out, and whether anything has
+    // happened since — a message of ours written, or new output streamed. A
+    // result in that window with neither can only be the stopped turn
+    // reporting late, and is dropped. Anything else is reconciled like any
+    // result (held for unconfirmed messages, settled by their fallback):
+    // dropping on time alone lost a quick replacement's own end.
     let mut stop_done_at: Option<tokio::time::Instant> = None;
-    let mut started_since_stop = false;
+    let mut active_since_stop = false;
     let mut commands = Commands::default();
     commands.written(first_command);
     // A `result` that is a steer boundary rather than the turn's end (see
@@ -942,7 +945,7 @@ async fn run_session(session: Session) {
                     };
                     if taken_up {
                         held_done = None;
-                        started_since_stop = true;
+                        active_since_stop = true;
                     }
                     if let Some(at) = confirmed
                         .and_then(|id| pending_steers.iter().position(|p| *p == id))
@@ -987,10 +990,13 @@ async fn run_session(session: Session) {
                         } else {
                             !pending_steers.is_empty()
                         };
+                        if !is_done && stop_done_at.is_some() {
+                            active_since_stop = true;
+                        }
                         if is_done
                             && !interrupted
                             && stopping.is_none()
-                            && !started_since_stop
+                            && !active_since_stop
                             && stop_done_at.is_some_and(|at| at.elapsed() < STOP_SETTLE)
                         {
                             tracing::debug!(
@@ -1009,7 +1015,7 @@ async fn run_session(session: Session) {
                             if stopping.take().is_some() {
                                 stopped_end = None;
                                 stop_done_at = Some(tokio::time::Instant::now());
-                                started_since_stop = false;
+                                active_since_stop = false;
                             }
                             stop_settle_at = None;
                         }
@@ -1034,6 +1040,8 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
+                    // A message of ours now owns whatever result comes next.
+                    active_since_stop = true;
                     // A changed configuration applies before the prompt, on
                     // the same stdin the CLI reads in order.
                     if let Some(next) = msg.config {
@@ -1118,7 +1126,7 @@ async fn run_session(session: Session) {
                     }
                     any_done = true;
                     stop_done_at = Some(tokio::time::Instant::now());
-                    started_since_stop = false;
+                    active_since_stop = false;
                 }
             },
 
