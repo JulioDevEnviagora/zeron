@@ -313,6 +313,32 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:stop-steer*)
+  # "Send now" with a steer still in flight: the steering request is
+  # unanswered when the turn stop's session/cancel arrives, and answers
+  # promptRequired before the cancelled prompt settles. The cancelled steer
+  # must never run.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  read -r steerline || exit 1
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  sid=$(rid "$steerline")
+  read -r cancel || exit 1
+  has "$cancel" '"method":"session/cancel"' || exit 1
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"promptRequired\"}}"
+  sleep 0.2
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
+  read -r next || exit 1
+  has "$next" '"method":"session/prompt"' || exit 1
+  nid=$(rid "$next")
+  if has "$next" 'cancelled steer'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REPLAYED"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh"}}'
+  fi
+  emit "{\"id\":$nid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
+  ;;
+
 *scenario:steer-race*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
   read -r steerline || exit 1

@@ -4470,9 +4470,9 @@ async fn run_session(session: Session) {
                         "promptRequired".to_owned()
                     }
                 };
-                if interrupted {
-                    // The run is winding down; the steer is abandoned like
-                    // any queued steer at interrupt.
+                if interrupted || stopping {
+                    // The run is winding down, or its turn stopping: the
+                    // steer is abandoned like any queued steer.
                 } else if outcome != "promptRequired" {
                     // Injected into a live turn → a Steered boundary. But if
                     // the turn ended while the call was in flight, the
@@ -4895,6 +4895,10 @@ async fn run_session(session: Session) {
             _ = turn_control.stop_requested(), if !interrupted => {
                 queued_steers.clear();
                 steer_backlog.clear();
+                // A steer still in flight goes with the turn too: its answer
+                // (promptRequired, once the turn is cancelled) would queue it
+                // again and run the cancelled message after all.
+                steering_call = None;
                 deferred.clear();
                 released = None;
                 preempt_pending = false;

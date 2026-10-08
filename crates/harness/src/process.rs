@@ -104,36 +104,51 @@ mod tests {
     /// and `terminate_tree` ends it.
     #[tokio::test]
     async fn tree_teardown_reaches_shells_in_their_own_process_group() {
+        /// Ends the fixture shell even when an assertion fails first.
+        struct Reap(i32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: SIGKILL to the fixture's own pid.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        // The child reports its pid only once it leads its own group: waiting
+        // for it to exist was not enough (it had not called setpgid yet).
+        let script = format!(
+            "python3 -c 'import os, time; os.setpgid(0, 0); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(60)' & sleep 60",
+            ready.display()
+        );
         let mut parent = tokio::process::Command::new("sh")
-            .args([
-                "-c",
-                "python3 -c 'import os, time; os.setpgid(0, 0); time.sleep(60)' & sleep 60",
-            ])
+            .args(["-c", &script])
             .kill_on_drop(true)
             .spawn()
             .unwrap();
         let root = parent.id().unwrap();
-        let mut tree = Vec::new();
-        for _ in 0..100 {
-            tree = descendants(root).await;
-            if tree.len() >= 2 {
+        let mut shell = None;
+        for _ in 0..250 {
+            if let Some(pid) = std::fs::read_to_string(&ready)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                shell = Some(pid);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let own_group: Vec<i32> = tree
-            .iter()
-            .copied()
-            .filter(|&pid| unsafe { libc::getpgid(pid) } == pid)
-            .collect();
-        assert_eq!(own_group.len(), 1, "{tree:?}");
+        let shell = shell.expect("the shell leads its own process group");
+        let _reap = Reap(shell);
+        assert_eq!(unsafe { libc::getpgid(shell) }, shell);
+        let tree = descendants(root).await;
+        assert!(tree.contains(&shell), "{tree:?}");
         // The parent dies hard (an unresponsive agent's SIGKILL): the shell
         // is orphaned, not killed.
         parent.kill().await.unwrap();
-        assert_eq!(unsafe { libc::kill(own_group[0], 0) }, 0, "orphan survives");
+        assert_eq!(unsafe { libc::kill(shell, 0) }, 0, "orphan survives");
         terminate_tree(&tree, std::time::Duration::from_secs(2)).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_ne!(unsafe { libc::kill(own_group[0], 0) }, 0, "orphan ended");
+        assert_ne!(unsafe { libc::kill(shell, 0) }, 0, "orphan ended");
     }
 
     #[tokio::test]

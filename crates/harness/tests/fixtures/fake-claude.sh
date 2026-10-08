@@ -193,6 +193,38 @@ case "$first" in
   emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$sid\",\"state\":\"completed\"}"
   ;;
 
+*scenario:stop-held*)
+  # "Send now" while a turn's result is held for a queued steer: the CLI is
+  # slow to answer the stop, had already begun the steer's turn, and that
+  # turn's aborted result lands after the stop — before the replacement.
+  fid=$(uuid_of "$first")
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$fid\",\"state\":\"started\"}"
+  emit '{"type":"system","subtype":"init","model":"claude-sonnet-5-5","tools":[],"cwd":"/tmp","session_id":"sess-sh"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first answer"}}}'
+  read -r steer || exit 1
+  sid=$(uuid_of "$steer")
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$sid\",\"state\":\"queued\"}"
+  emit '{"type":"result","subtype":"success","is_error":false,"result":"first answer","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-sh"}'
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$fid\",\"state\":\"completed\"}"
+  read -r stop || exit 1
+  case "$stop" in *'"subtype":"interrupt"'*) ;; *) exit 8 ;; esac
+  rid=$(printf '%s\n' "$stop" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  sleep 0.5
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$sid\",\"state\":\"started\"}"
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"still_queued\":[]}}}"
+  emit '{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-sh"}'
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$sid\",\"state\":\"cancelled\"}"
+  read -r next || exit 1
+  nid=$(uuid_of "$next")
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$nid\",\"state\":\"started\"}"
+  emit "$next"
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"replacement"}}}'
+  sleep 0.3
+  emit '{"type":"result","subtype":"success","is_error":false,"result":"replacement","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-sh"}'
+  emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$nid\",\"state\":\"completed\"}"
+  cat >/dev/null
+  ;;
+
 *scenario:lifecycle-queued-cancelled*)
   # A queued message cancelled before any turn takes it up: the result held
   # for it was the turn's real end, released at once — no quiet timer.

@@ -853,9 +853,16 @@ async fn run_session(session: Session) {
     let mut stops_sent = 0u64;
     let mut stopping: Option<String> = None;
     let mut stop_settle_at: Option<tokio::time::Instant> = None;
-    // The stopped turn's Done already went out (a held turn end released
-    // by the stop): the settle deadline must not send a second one.
-    let mut stop_done_sent = false;
+    // A turn end held for steers when the stop came: that turn's end, sent
+    // as stopped once the stop settles — never before. Released early, the
+    // host started the replacement prompt while the stopped turn could still
+    // report, and that late result settled the replacement.
+    let mut stopped_end: Option<AgentEvent> = None;
+    // When the stopped turn's one Done went out, and whether a message of
+    // ours has started a turn since: a result in between is that stopped
+    // turn reporting late, and is dropped.
+    let mut stop_done_at: Option<tokio::time::Instant> = None;
+    let mut started_since_stop = false;
     let mut commands = Commands::default();
     commands.written(first_command);
     // A `result` that is a steer boundary rather than the turn's end (see
@@ -935,6 +942,7 @@ async fn run_session(session: Session) {
                     };
                     if taken_up {
                         held_done = None;
+                        started_since_stop = true;
                     }
                     if let Some(at) = confirmed
                         .and_then(|id| pending_steers.iter().position(|p| *p == id))
@@ -979,6 +987,18 @@ async fn run_session(session: Session) {
                         } else {
                             !pending_steers.is_empty()
                         };
+                        if is_done
+                            && !interrupted
+                            && stopping.is_none()
+                            && !started_since_stop
+                            && stop_done_at.is_some_and(|at| at.elapsed() < STOP_SETTLE)
+                        {
+                            tracing::debug!(
+                                target: "zeron_harness::claude",
+                                "late result of a stopped turn dropped"
+                            );
+                            continue;
+                        }
                         if is_done && !interrupted && stopping.is_none() && boundary {
                             held_done = Some(ev);
                             continue;
@@ -986,7 +1006,11 @@ async fn run_session(session: Session) {
                         if is_done {
                             held_done = None;
                             // The stopped turn has ended; the runtime lives on.
-                            stopping = None;
+                            if stopping.take().is_some() {
+                                stopped_end = None;
+                                stop_done_at = Some(tokio::time::Instant::now());
+                                started_since_stop = false;
+                            }
                             stop_settle_at = None;
                         }
                         if event_tx.send(Ok(ev)).await.is_err() {
@@ -1061,23 +1085,19 @@ async fn run_session(session: Session) {
                 commands.cancel_waiting();
                 stopping = Some(id.clone());
                 stop_settle_at = None;
-                stop_done_sent = false;
+                stop_done_at = None;
                 if stdin_tx.send(StdinMsg::Line(wire::stop_turn_request_line(&id))).is_err() {
                     break 'main;
                 }
                 // A turn end held for steer replays is that turn's real end:
-                // its steers were just cancelled, so release it as stopped.
+                // its steers were just cancelled, so it ends stopped — once
+                // the stop settles. A turn the CLI had already begun for
+                // those steers reports first, and that report is the end.
                 if let Some(mut done) = held_done.take() {
                     if let AgentEvent::Done { status, .. } = &mut done {
                         *status = DoneStatus::Interrupted;
                     }
-                    // `stopping` stays set until the CLI answers: a turn it
-                    // had already begun for those steers ends stopped too.
-                    stop_done_sent = true;
-                    if event_tx.send(Ok(done)).await.is_err() {
-                        break 'main;
-                    }
-                    any_done = true;
+                    stopped_end = Some(done);
                 }
             },
 
@@ -1086,16 +1106,19 @@ async fn run_session(session: Session) {
             _ = tokio::time::sleep_until(stop_settle_at.unwrap_or_else(tokio::time::Instant::now)),
                 if stop_settle_at.is_some() => {
                 stop_settle_at = None;
-                if stopping.take().is_some() && !stop_done_sent {
-                    if event_tx.send(Ok(AgentEvent::Done {
+                if stopping.take().is_some() {
+                    let done = stopped_end.take().unwrap_or(AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
                         error: None,
                         session_id: norm.session_id.clone(),
-                    })).await.is_err() {
+                    });
+                    if event_tx.send(Ok(done)).await.is_err() {
                         break 'main;
                     }
                     any_done = true;
+                    stop_done_at = Some(tokio::time::Instant::now());
+                    started_since_stop = false;
                 }
             },
 

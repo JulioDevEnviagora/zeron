@@ -339,6 +339,57 @@ async fn teardown_ends_a_command_the_agent_detached() {
     assert!(!alive(), "the detached command outlived the runtime");
 }
 
+/// "Send now" while a steer's request is still in flight: the stop cancels
+/// that steer with the turn. Its late promptRequired answer must not queue
+/// it again, or the cancelled message runs after all.
+#[tokio::test]
+async fn a_turn_stop_cancels_a_steer_still_in_flight() {
+    use zeron_harness::TurnControl;
+    let (mut controls, steer, _token) = controls();
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:stop-steer"), controls)
+        .await
+        .expect("run starts");
+    macro_rules! next {
+        () => {
+            tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("event in time")
+                .expect("stream open")
+                .expect("stream event")
+        };
+    }
+    loop {
+        if matches!(next!(), AgentEvent::TextDelta { text } if text == "working") {
+            break;
+        }
+    }
+    steer
+        .send(SteerMessage::text("cancelled steer"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    turn.stop_turn();
+    loop {
+        if let AgentEvent::Done { status, .. } = next!() {
+            assert_eq!(status, DoneStatus::Interrupted);
+            break;
+        }
+    }
+    steer.send(SteerMessage::text("after")).await.unwrap();
+    let mut texts = Vec::new();
+    loop {
+        match next!() {
+            AgentEvent::TextDelta { text } => texts.push(text),
+            AgentEvent::Done { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(texts, ["fresh"], "the cancelled steer ran after the stop");
+}
+
 #[tokio::test]
 async fn resumed_first_class_model_is_switched_before_prompt() {
     let (controls, _steer, _token) = controls();

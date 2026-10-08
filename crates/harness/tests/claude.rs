@@ -1001,6 +1001,80 @@ async fn a_message_queued_behind_a_finishing_turn_owns_the_turn_end() {
     assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
 }
 
+/// "Send now" while a turn end is held for a queued steer: the stop's one
+/// Done waits for the stop to settle, so the replacement prompt — sent the
+/// moment that Done arrives — runs to its own end, never settled by the
+/// stopped turn's late result.
+#[tokio::test]
+async fn send_now_over_a_held_turn_end_never_settles_the_replacement() {
+    use zeron_harness::TurnControl;
+    let (mut controls, steer, _token) = controls("A");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:stop-held"), controls)
+        .await
+        .expect("run starts");
+    steer.send(steer_msg("queued steer")).await.unwrap();
+    macro_rules! next {
+        () => {
+            tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("event in time")
+                .expect("stream open")
+                .expect("stream event")
+        };
+    }
+    loop {
+        if matches!(next!(), AgentEvent::TextDelta { text } if text == "first answer") {
+            break;
+        }
+    }
+    // Let the result be held behind the queued steer, then stop.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    turn.stop_turn();
+    let stopped = loop {
+        if let done @ AgentEvent::Done { .. } = next!() {
+            break done;
+        }
+    };
+    assert!(
+        matches!(
+            stopped,
+            AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            }
+        ),
+        "{stopped:?}"
+    );
+    // The replacement goes out the moment the stop settles.
+    steer.send(steer_msg("replacement")).await.unwrap();
+    let mut after = Vec::new();
+    let end = loop {
+        match next!() {
+            done @ AgentEvent::Done { .. } => break done,
+            event => after.push(event),
+        }
+    };
+    assert!(
+        after.contains(&AgentEvent::TextDelta {
+            text: "replacement".into()
+        }),
+        "the replacement turn was settled before its reply: {after:?} then {end:?}"
+    );
+    assert!(
+        matches!(
+            end,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ),
+        "{end:?}"
+    );
+}
+
 /// A queued message the CLI cancels before starting releases the held turn
 /// end at once, from the lifecycle frame — not after a quiet timer.
 #[tokio::test]
