@@ -1136,6 +1136,57 @@ async fn a_quick_unconfirmed_replacement_after_a_stop_still_completes() {
     );
 }
 
+/// A stopped turn reporting a second, delayed result — no new prompt, no
+/// new content — is dropped whole: no second Done (an Errored one failed
+/// the parked session), and none of its usage.
+#[tokio::test]
+async fn a_stopped_turns_delayed_duplicate_result_is_dropped() {
+    use zeron_harness::TurnControl;
+    let (mut controls, _steer, _token) = controls("A");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:stop-late-duplicate"), controls)
+        .await
+        .expect("run starts");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        if matches!(event, AgentEvent::TextDelta { text } if text == "working") {
+            break;
+        }
+    }
+    turn.stop_turn();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("stream event");
+        if let AgentEvent::Done { status, .. } = event {
+            assert_eq!(status, DoneStatus::Interrupted);
+            break;
+        }
+    }
+    let mut after = Vec::new();
+    let quiet = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = stream.next().await {
+            after.push(event.expect("stream event"));
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the stream ended: {after:?}");
+    assert!(
+        !after
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Usage { .. })),
+        "the stopped turn's late duplicate was forwarded: {after:?}"
+    );
+}
+
 /// A queued message the CLI cancels before starting releases the held turn
 /// end at once, from the lifecycle frame — not after a quiet timer.
 #[tokio::test]

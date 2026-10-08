@@ -969,6 +969,22 @@ async fn run_session(session: Session) {
                         }
                         any_done = true;
                     }
+                    // The stopped turn reporting late: a result with nothing
+                    // since the stop's Done. Judged on the frame, before it
+                    // expands — its own Usage is not new activity — and
+                    // dropped whole, usage included.
+                    if matches!(frame, Frame::Result(_))
+                        && !interrupted
+                        && stopping.is_none()
+                        && !active_since_stop
+                        && stop_done_at.is_some_and(|at| at.elapsed() < STOP_SETTLE)
+                    {
+                        tracing::debug!(
+                            target: "zeron_harness::claude",
+                            "late result of a stopped turn dropped"
+                        );
+                        continue;
+                    }
                     for ev in norm.normalize(frame, interrupted || stopping.is_some()) {
                         match &ev {
                             AgentEvent::ToolCall { id, .. } => {
@@ -990,20 +1006,19 @@ async fn run_session(session: Session) {
                         } else {
                             !pending_steers.is_empty()
                         };
-                        if !is_done && stop_done_at.is_some() {
-                            active_since_stop = true;
-                        }
-                        if is_done
-                            && !interrupted
-                            && stopping.is_none()
-                            && !active_since_stop
-                            && stop_done_at.is_some_and(|at| at.elapsed() < STOP_SETTLE)
+                        // New content is a new turn's: its result is its own.
+                        if stop_done_at.is_some()
+                            && match &ev {
+                                AgentEvent::TextDelta { text }
+                                | AgentEvent::ReasoningDelta { text } => !text.is_empty(),
+                                AgentEvent::ToolCall { .. }
+                                | AgentEvent::ToolResult { .. }
+                                | AgentEvent::InputRequested { .. }
+                                | AgentEvent::Subagent { .. } => true,
+                                _ => false,
+                            }
                         {
-                            tracing::debug!(
-                                target: "zeron_harness::claude",
-                                "late result of a stopped turn dropped"
-                            );
-                            continue;
+                            active_since_stop = true;
                         }
                         if is_done && !interrupted && stopping.is_none() && boundary {
                             held_done = Some(ev);
