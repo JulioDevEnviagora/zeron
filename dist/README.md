@@ -36,7 +36,9 @@ dmg. The auto-update tarball retains an internal `Zeron.app` path so older
 installed builds can update into Zeron. The release workflow builds Apple
 silicon (`arm64`) and Intel (`x86_64`) packages on native macOS runners,
 including the app tarball used by the updater
-(`.github/workflows/release.yml`). The manual steps it automates, for reference
+(`.github/workflows/release.yml`). For Intel, it first builds the pinned ONNX
+Runtime 1.28.0 from source and sets `ORT_LIB_PATH`; a manual Intel build needs
+the same compatible runtime. The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
