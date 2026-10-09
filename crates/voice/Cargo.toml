@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-parakeet-rs = "=0.3.8"
 cpal = "=0.17.3"
 rubato = "=0.16.2"
 reqwest.workspace = true
@@ -19,3 +18,9 @@ serde_json.workspace = true
 [dev-dependencies]
 hound = "3.5"
 tempfile.workspace = true
+
+# ort-sys 2.0.0-rc.13 (via parakeet-rs) ships no ONNX Runtime for
+# x86_64-apple-darwin, and upstream no longer publishes one. Intel Macs
+# still build; local dictation reports that at runtime.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+parakeet-rs = "=0.3.8"
