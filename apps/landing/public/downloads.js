@@ -2,6 +2,7 @@
   const base = "https://zeron.sh/releases/";
   const releases = {
     macos: ["macos-arm64.dmg", "Download for macOS", "Apple silicon"],
+    "macos-intel": ["macos-x86_64.dmg", "Download for macOS", "Intel"],
     windows: ["windows-x86_64-setup.exe", "Download for Windows", "Windows x64 · Installer"],
     "windows-portable": ["windows-x86_64.zip", "Download for Windows", "Windows x64 · Portable ZIP"],
     linux: ["linux-x86_64.tar.gz", "Download for Linux", "Linux x64"],
