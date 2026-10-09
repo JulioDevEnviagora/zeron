@@ -2,7 +2,7 @@ name: release
 
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
+#   - macOS dmg (Apple silicon + Intel x86_64) via scripts/package-macos.sh
 #   - Windows per-user installer, portable zip, and updater exe (x86_64) via
 #     scripts/package-windows.ps1
 # then create a GitHub Release AND upload everything to the
@@ -93,7 +93,7 @@ jobs:
             -s -k "$pass" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
           identity="$(security find-identity -v -p codesigning "$keychain" \
-            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+            | sed -n 's/.*\"\(Developer ID Application: [^\"]*\)\".*/\1/p' | head -1)"
           [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
           echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
       - name: notary credentials
@@ -110,6 +110,59 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-${{ runner.arch }}
+          path: |
+            target/package/*.dmg
+            target/package/*.tar.gz
+          if-no-files-found: error
+
+  # Same package script as Apple silicon. Host arch is x86_64, so the artifact
+  # is zeron-<version>-macos-x86_64.dmg (issue #841).
+  macos-intel:
+    runs-on: macos-15-intel
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*\"\(Developer ID Application: [^\"]*\)\".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+      - name: notary credentials
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8"
+            echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+      - name: package dmg
+        run: scripts/package-macos.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-x86_64
           path: |
             target/package/*.dmg
             target/package/*.tar.gz
@@ -144,7 +197,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [cursor-compatibility, linux, macos, windows]
+    needs: [cursor-compatibility, linux, macos, macos-intel, windows]
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
@@ -162,6 +215,7 @@ jobs:
           ls dist/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
               macos-arm64.dmg macos-arm64-app.tar.gz \
+              macos-x86_64.dmg macos-x86_64-app.tar.gz \
               windows-x86_64.zip windows-x86_64.exe windows-x86_64-setup.exe; do
             test -f "dist/zeron-$ver-$platform" \
               || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
