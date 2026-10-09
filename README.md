@@ -21,14 +21,14 @@ No account or network connection is needed; sessions stay on your device. The ap
 
 For servers and other machines without a display, such as a VPS that keeps agents running after you close your laptop. Linux only:
 
-```sh
+```bash
 curl -fsSL https://zeron.sh/install.sh | sh
 zeron status
 ```
 
 The installer starts the engine as a background service that survives reboots.
 
-```sh
+```bash
 zeron status      # local/synced mode and engine status
 zeron update      # update to the latest release
 zeron daemon start|stop|restart|status
@@ -38,10 +38,20 @@ zeron daemon start|stop|restart|status
 
 Sign in to start an agent on one device and follow or drive it from another:
 
-```sh
+```bash
 zeron daemon stop
 zeron login        # or: zeron logout to return to local-only
 zeron daemon start
 ```
 
-Devices signed in to the same account can read and write each other's workspace files, so only sign in devices you trust.
+Devices signed in to the same account can read and write each other's workspace files, so only sign in devices you trust. Existing local sessions are never uploaded.
+
+## Sponsors
+
+Thank you to [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron. You can help fund Zeron's development too by [becoming a sponsor on GitHub](https://github.com/sponsors/zeronsh).
+
+---
+
+Developing or curious how it works? [Ask DeepWiki](https://deepwiki.com/zeronsh/zeron) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Licensed under the [MIT License](LICENSE).
