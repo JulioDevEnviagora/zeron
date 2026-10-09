@@ -2,7 +2,7 @@ name: release
 
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
+#   - macOS dmg (Apple silicon + Intel x86_64) via scripts/package-macos.sh
 #   - Windows per-user installer, portable zip, and updater exe (x86_64) via
 #     scripts/package-windows.ps1
 # then create a GitHub Release AND upload everything to the
@@ -64,7 +64,15 @@ jobs:
   #     key (raw .p8 contents), for notarytool. All three present → the package
   #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
-    runs-on: macos-latest # Apple silicon
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest # Apple silicon
+            artifact: arm64
+          - runner: macos-15-intel # Intel x86_64
+            artifact: x86_64
+    runs-on: ${{ matrix.runner }}
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -93,7 +101,7 @@ jobs:
             -s -k "$pass" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
           identity="$(security find-identity -v -p codesigning "$keychain" \
-            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+            | sed -n 's/.*\"\(Developer ID Application: [^\"]*\)\".*/\1/p' | head -1)"
           [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
           echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
       - name: notary credentials
@@ -109,7 +117,7 @@ jobs:
         run: scripts/package-macos.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: macos-${{ runner.arch }}
+          name: macos-${{ matrix.artifact }}
           path: |
             target/package/*.dmg
             target/package/*.tar.gz
@@ -162,6 +170,7 @@ jobs:
           ls dist/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
               macos-arm64.dmg macos-arm64-app.tar.gz \
+              macos-x86_64.dmg macos-x86_64-app.tar.gz \
               windows-x86_64.zip windows-x86_64.exe windows-x86_64-setup.exe; do
             test -f "dist/zeron-$ver-$platform" \
               || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
